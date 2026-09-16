@@ -18,13 +18,39 @@ const corsHeaders = {
   'access-control-allow-methods': 'GET, PUT, POST, OPTIONS',
   'access-control-allow-headers': 'Content-Type, Authorization, X-Requested-With',
   'access-control-max-age': '86400',
-  vary: 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+  'access-control-allow-credentials': 'true',
+  vary: 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers',
+  // ISO 27001 Security Headers
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'x-xss-protection': '1; mode=block',
+  'strict-transport-security': 'max-age=31536000; includeSubDomains',
+  'cache-control': 'no-store, no-cache, must-revalidate, max-age=0',
+  'pragma': 'no-cache',
+  'expires': '0'
 };
 
 const sessionCookieName = 'rd_local_session';
 const sessionDurationSeconds = 60 * 60 * 8;
 const allowedRoles = new Set(['admin', 'pm', 'pe', 'ce', 'me', 'sme', 'qe', 'viewer']);
-const defaultAdminPassword = process.env.LOCAL_ADMIN_PASSWORD || 'admin123';
+const defaultAdminPassword = process.env.LOCAL_ADMIN_PASSWORD || 'Admin@2026Secure';
+
+// ISO 27001 compliant password policy
+function validatePassword(password, email) {
+  if (!password) return { valid: false, error: '密碼不能為空' };
+  if (password.length < 12) return { valid: false, error: '密碼至少需要 12 個字符（ISO 27001 規範）' };
+  if (!/[A-Z]/.test(password)) return { valid: false, error: '密碼必須包含至少一個大寫字母' };
+  if (!/[a-z]/.test(password)) return { valid: false, error: '密碼必須包含至少一個小寫字母' };
+  if (!/\d/.test(password)) return { valid: false, error: '密碼必須包含至少一個數字' };
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>?]/.test(password)) {
+    return { valid: false, error: '密碼必須包含至少一個特殊字符（!@#$%^&*等）' };
+  }
+  // Prevent using email/username in password
+  if (email && password.toLowerCase().includes(email.split('@')[0].toLowerCase())) {
+    return { valid: false, error: '密碼不能包含帳號名稱' };
+  }
+  return { valid: true };
+}
 
 function addCorsHeaders(headers = {}) {
   return { ...corsHeaders, ...headers };
@@ -58,6 +84,23 @@ function hashPasswordSync(password) {
   const salt = crypto.randomBytes(16);
   const key = crypto.scryptSync(password, salt, 32);
   return Buffer.concat([salt, key]).toString('hex');
+}
+
+function generateSecurePassword() {
+  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const lower = 'abcdefghijklmnopqrstuvwxyz';
+  const digits = '0123456789';
+  const special = '!@#$%^&*_+-=';
+  const all = upper + lower + digits + special;
+  let pwd = '';
+  pwd += upper[Math.floor(Math.random() * upper.length)];
+  pwd += lower[Math.floor(Math.random() * lower.length)];
+  pwd += digits[Math.floor(Math.random() * digits.length)];
+  pwd += special[Math.floor(Math.random() * special.length)];
+  for (let i = 0; i < 8; i++) {
+    pwd += all[Math.floor(Math.random() * all.length)];
+  }
+  return pwd.split('').sort(() => Math.random() - 0.5).join('');
 }
 
 async function verifyPassword(password, hash) {
@@ -458,12 +501,17 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
-        const password = payload?.password || 'password123';
-        if (password.length < 6) {
+        // Generate ISO 27001 compliant default password if not provided
+        let password = payload?.password;
+        if (!password) {
+          password = generateSecurePassword();
+        }
+        const pwdValidation = validatePassword(password, validated.email);
+        if (!pwdValidation.valid) {
           response.writeHead(400, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
-          response.end(JSON.stringify({ error: '密碼至少需要 6 個字元' }));
+          response.end(JSON.stringify({ error: pwdValidation.error }));
           return;
         }
 
@@ -515,12 +563,15 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
-        if (payload?.password && payload.password.length < 6) {
-          response.writeHead(400, addCorsHeaders({
-            'content-type': 'application/json; charset=utf-8'
-          }));
-          response.end(JSON.stringify({ error: '密碼至少需要 6 個字元' }));
-          return;
+        if (payload?.password) {
+          const pwdValidation = validatePassword(payload.password, targetEmail);
+          if (!pwdValidation.valid) {
+            response.writeHead(400, addCorsHeaders({
+              'content-type': 'application/json; charset=utf-8'
+            }));
+            response.end(JSON.stringify({ error: pwdValidation.error }));
+            return;
+          }
         }
 
         const existing = getUserByEmail(db, targetEmail);
@@ -694,8 +745,8 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
-        // Verify password
-        const secRow = db.prepare('SELECT password_hash FROM rd_app_user_security WHERE email = ?').get(email);
+        // Verify password and check account status
+        const secRow = db.prepare('SELECT password_hash, enabled, locked_until, login_attempts FROM rd_app_user_security WHERE email = ?').get(email);
         const passwordHash = secRow?.password_hash;
         const passwordValid = await verifyPassword(password, passwordHash);
         if (!passwordValid) {

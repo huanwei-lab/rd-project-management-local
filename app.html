@@ -334,7 +334,7 @@ function ensureAccountModal(){
       <div>\
         <div class="field"><label>顯示名稱</label><input id="accountNameInput" placeholder="例如：王小明"></div>\
         <div class="field"><label>Email</label><input id="accountEmailInput" placeholder="name@company.com" readonly></div>\
-        <div class="field"><label>密碼</label><input id="accountPasswordInput" type="password" placeholder="留空不變更"></div>\
+        <div class="field"><label>密碼</label><input id="accountPasswordInput" type="password" placeholder="留空不變更"><div style="font-size:.7rem;color:#666;margin-top:4px">※ ISO 27001規範：至少12字元，需包含大小寫字母、數字、特殊字符(!@#$等)</div></div>\
         <div class="field"><label>角色</label><select id="accountRoleInput"><option>admin</option><option>pm</option><option>pe</option><option>ce</option><option>me</option><option>sme</option><option>qe</option><option selected>viewer</option></select></div>\
         <div style="padding:8px;background:#f7f8fb;border-radius:6px;font-size:.75rem;color:#666;margin:8px 0">\
           <div id="accountStatusBox">最後登入：未知</div>\
@@ -454,19 +454,30 @@ function bindAccountModalEvents(){
     if(state.selectedEmail){
       const payload={displayName,accessRole};
       if(password)payload.password=password;
-      await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
-      toast('帳號已更新');
+      try{
+        await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+        toast('帳號已更新');
+      }catch(e){
+        toast('更新失敗: ' + e.message);
+        return;
+      }
     }else{
       if(!password){
         toast('新增帳號時請設置密碼');
         return;
       }
-      const result=await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole,password})});
-      state.selectedEmail=email;
-      toast(`帳號已新增（密碼: ${result.defaultPassword}）`);
+      try{
+        const result=await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole,password})});
+        state.selectedEmail=email;
+        toast(`帳號已新增\n臨時密碼: ${result.defaultPassword || password}\n(首次登入後請修改密碼)`);
+      }catch(e){
+        toast('新增失敗: ' + e.message);
+        return;
+      }
     }
 
     await refreshUsersAndRender();
+    fillAccountForm(null);
     await refreshAudit();
   };
 

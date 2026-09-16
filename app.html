@@ -238,10 +238,12 @@ async function apiJson(url,options={}){
 async function loginPrompt(){
   const users=await fetchUsers();
   const defaultEmail=users[0].email;
-  const choices=users.map(u=>`${u.displayName} <${u.email}> (${u.accessRole})`).join('\n');
-  const email=(await promptInput(`請輸入登入 Email（可用帳號）\n${choices}`,defaultEmail)).trim().toLowerCase();
+  const choices=users.map(u=>`${u.displayName} <${u.email}>`).join('\n');
+  const email=(await promptInput(`請輸入登入 Email\n${choices}`,defaultEmail)).trim().toLowerCase();
   if(!email)return false;
-  const response=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})});
+  const password=await promptInput('請輸入密碼','');
+  if(!password)return false;
+  const response=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,password})});
   const data=await response.json();
   if(!response.ok)throw new Error(data.error||'登入失敗');
   sharedSession=data.user;
@@ -332,6 +334,7 @@ function ensureAccountModal(){
       <div>\
         <div class="field"><label>顯示名稱</label><input id="accountNameInput" placeholder="例如：王小明"></div>\
         <div class="field"><label>Email</label><input id="accountEmailInput" placeholder="name@company.com" readonly></div>\
+        <div class="field"><label>密碼</label><input id="accountPasswordInput" type="password" placeholder="留空不變更"></div>\
         <div class="field"><label>角色</label><select id="accountRoleInput"><option>admin</option><option>pm</option><option>pe</option><option>ce</option><option>me</option><option>sme</option><option>qe</option><option selected>viewer</option></select></div>\
         <div style="padding:8px;background:#f7f8fb;border-radius:6px;font-size:.75rem;color:#666;margin:8px 0">\
           <div id="accountStatusBox">最後登入：未知</div>\
@@ -379,6 +382,7 @@ function fillAccountForm(user){
   $('#accountNameInput').value=user?.displayName||'';
   $('#accountEmailInput').value=user?.email||'';
   $('#accountEmailInput').readOnly=Boolean(user?.email);
+  $('#accountPasswordInput').value='';
   $('#accountRoleInput').value=user?.accessRole||'viewer';
   const statusEl=$('#accountStatusBox');
   if(user){
@@ -440,6 +444,7 @@ function bindAccountModalEvents(){
   $('#accountSaveBtn').onclick=async()=>{
     const email=$('#accountEmailInput').value.trim().toLowerCase();
     const displayName=$('#accountNameInput').value.trim();
+    const password=$('#accountPasswordInput').value.trim();
     const accessRole=$('#accountRoleInput').value;
     if(!email||!displayName){
       toast('請填寫姓名與 Email');
@@ -447,12 +452,18 @@ function bindAccountModalEvents(){
     }
 
     if(state.selectedEmail){
-      await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({displayName,accessRole})});
+      const payload={displayName,accessRole};
+      if(password)payload.password=password;
+      await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
       toast('帳號已更新');
     }else{
-      await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole})});
+      if(!password){
+        toast('新增帳號時請設置密碼');
+        return;
+      }
+      const result=await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole,password})});
       state.selectedEmail=email;
-      toast('帳號已新增');
+      toast(`帳號已新增（密碼: ${result.defaultPassword}）`);
     }
 
     await refreshUsersAndRender();

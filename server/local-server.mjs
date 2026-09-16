@@ -1,9 +1,12 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+
+const scrypt = promisify(crypto.scrypt);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +24,7 @@ const corsHeaders = {
 const sessionCookieName = 'rd_local_session';
 const sessionDurationSeconds = 60 * 60 * 8;
 const allowedRoles = new Set(['admin', 'pm', 'pe', 'ce', 'me', 'sme', 'qe', 'viewer']);
+const defaultAdminPassword = process.env.LOCAL_ADMIN_PASSWORD || 'admin123';
 
 function addCorsHeaders(headers = {}) {
   return { ...corsHeaders, ...headers };
@@ -48,6 +52,25 @@ function validState(value) {
           Array.isArray(project.tasks)
       )
   );
+}
+
+function hashPasswordSync(password) {
+  const salt = crypto.randomBytes(16);
+  const key = crypto.scryptSync(password, salt, 32);
+  return Buffer.concat([salt, key]).toString('hex');
+}
+
+async function verifyPassword(password, hash) {
+  if (!hash) return false;
+  const buf = Buffer.from(hash, 'hex');
+  const salt = buf.slice(0, 16);
+  const key = buf.slice(16);
+  try {
+    const derivedKey = await scrypt(password, salt, 32);
+    return crypto.timingSafeEqual(key, derivedKey);
+  } catch {
+    return false;
+  }
 }
 
 function initializeDatabase(db) {
@@ -99,9 +122,11 @@ function initializeDatabase(db) {
   db.prepare(
     'INSERT OR IGNORE INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)'
   ).run(adminEmail, adminDisplayName, adminRole, now);
+  // Hash default admin password
+  const adminHashedPass = hashPasswordSync(defaultAdminPassword);
   db.prepare(
-    'INSERT OR IGNORE INTO rd_app_user_security (email, enabled, updated_at) VALUES (?, ?, ?)'
-  ).run(adminEmail, 1, now);
+    'INSERT OR REPLACE INTO rd_app_user_security (email, enabled, updated_at, password_hash) VALUES (?, ?, ?, ?)'
+  ).run(adminEmail, 1, now, adminHashedPass);
 
   const extraUsersJson = process.env.LOCAL_USERS_JSON;
   if (extraUsersJson) {
@@ -381,7 +406,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       const user = getSessionUser(request, db);
 
       if (url.pathname === '/api/login/options' && request.method === 'GET') {
-        const users = db.prepare('SELECT email, display_name AS displayName, access_role AS accessRole FROM rd_app_users ORDER BY created_at ASC, email ASC').all();
+        const users = db.prepare('SELECT email, display_name AS displayName FROM rd_app_users WHERE COALESCE((SELECT enabled FROM rd_app_user_security WHERE email = rd_app_users.email), 1) = 1 ORDER BY email ASC').all();
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store'
@@ -433,6 +458,15 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        const password = payload?.password || 'password123';
+        if (password.length < 6) {
+          response.writeHead(400, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '密碼至少需要 6 個字元' }));
+          return;
+        }
+
         const existing = getUserByEmail(db, validated.email);
         if (existing) {
           response.writeHead(409, addCorsHeaders({
@@ -442,17 +476,22 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        const now = new Date().toISOString();
+        const passwordHash = hashPasswordSync(password);
         db.prepare('INSERT INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)').run(
           validated.email,
           validated.displayName,
           validated.accessRole,
-          new Date().toISOString()
+          now
         );
+        db.prepare(
+          'INSERT INTO rd_app_user_security (email, enabled, updated_at, password_hash) VALUES (?, ?, ?, ?)'
+        ).run(validated.email, 1, now, passwordHash);
         appendAudit(db, user.email, `create_user:${validated.email}`);
         response.writeHead(201, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
-        response.end(JSON.stringify({ ok: true }));
+        response.end(JSON.stringify({ ok: true, defaultPassword: password }));
         return;
       }
 
@@ -476,6 +515,14 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        if (payload?.password && payload.password.length < 6) {
+          response.writeHead(400, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '密碼至少需要 6 個字元' }));
+          return;
+        }
+
         const existing = getUserByEmail(db, targetEmail);
         if (!existing) {
           response.writeHead(404, addCorsHeaders({
@@ -485,6 +532,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        const now = new Date().toISOString();
         const nextRole = validated.accessRole || existing.accessRole;
         if (existing.accessRole === 'admin' && nextRole !== 'admin') {
           const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users WHERE access_role='admin'").get().n;
@@ -502,6 +550,15 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           nextRole,
           targetEmail
         );
+        // Update password if provided
+        if (payload?.password) {
+          const passwordHash = hashPasswordSync(payload.password);
+          db.prepare('UPDATE rd_app_user_security SET password_hash=?, updated_at=? WHERE email=?').run(
+            passwordHash,
+            now,
+            targetEmail
+          );
+        }
         appendAudit(db, user.email, `update_user:${targetEmail}`);
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
@@ -627,20 +684,29 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       if (url.pathname === '/api/login' && request.method === 'POST') {
         const payload = await parseJsonBody(request);
         const email = payload?.email?.trim()?.toLowerCase();
+        const password = payload?.password || '';
         const nextUser = getUserByEmail(db, email);
         if (!nextUser) {
           response.writeHead(401, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
-          response.end(JSON.stringify({ error: '找不到此帳號' }));
+          response.end(JSON.stringify({ error: '帳號或密碼錯誤' }));
+          return;
+        }
+
+        // Verify password
+        const secRow = db.prepare('SELECT password_hash FROM rd_app_user_security WHERE email = ?').get(email);
+        const passwordHash = secRow?.password_hash;
+        const passwordValid = await verifyPassword(password, passwordHash);
+        if (!passwordValid) {
+          response.writeHead(401, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '帳號或密碼錯誤' }));
           return;
         }
 
         const now = new Date().toISOString();
-        const secRow = db.prepare(
-          `SELECT enabled, locked_until, login_attempts FROM rd_app_user_security WHERE email = ?`
-        ).get(email);
-
         const enabled = secRow?.enabled ?? 1;
         const lockedUntil = secRow?.locked_until;
         const loginAttempts = secRow?.login_attempts ?? 0;

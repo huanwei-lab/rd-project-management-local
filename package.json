@@ -6,6 +6,7 @@
     "start": "node server/local-server.mjs",
     "build": "node scripts/build.mjs",
     "validate": "node scripts/validate-artifact.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "test:lan": "node scripts/lan-diagnostic.mjs"
   }
 }

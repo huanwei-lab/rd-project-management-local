@@ -148,7 +148,9 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         if (request.method === 'PUT') {
           const next = await parseJsonBody(request);
           if (!validState(next)) {
-            response.writeHead(400, {'content-type': 'application/json; charset=utf-8'});
+            response.writeHead(400, addCorsHeaders({
+              'content-type': 'application/json; charset=utf-8'
+            }));
             response.end(JSON.stringify({ error: '專案資料格式錯誤' }));
             return;
           }

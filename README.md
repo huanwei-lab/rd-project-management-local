@@ -50,6 +50,7 @@ npm run start
 npm run build
 npm run validate
 npm test
+npm run test:lan
 ```
 
 ## 本地部署建議
@@ -58,6 +59,20 @@ npm test
 - 若需要從外網存取，請放在公司內網或透過 VPN、反向代理與 HTTPS
 - 建議每次重要變更先複製備份 JSON
 - 建議在正式環境中補上帳號權限與 HTTPS 保障
+
+## 各台電腦能連線的必要條件
+
+- 伺服器要啟動並監聽 `0.0.0.0`（本專案預設已是如此）
+- 所有電腦需要在同一個內網或可互通的網段
+- Windows 防火牆必須允許該埠的連入（預設為 `3000`）
+
+可以先在伺服器上執行：
+
+```bash
+npm run test:lan
+```
+
+若顯示 `[OK] http://<你的IP>:<port>/api/health`，代表服務已能從 LAN IP 回應。若仍無法從其他電腦開啟，通常是防火牆或網段路由限制。
 
 ## 主要檔案
 

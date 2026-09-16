@@ -9,6 +9,17 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 const defaultDbPath = path.join(rootDir, 'db', 'local-projects.sqlite');
 const defaultHtmlPath = path.join(rootDir, 'app.html');
+const corsHeaders = {
+  'access-control-allow-origin': process.env.ALLOWED_ORIGINS || '*',
+  'access-control-allow-methods': 'GET, PUT, OPTIONS',
+  'access-control-allow-headers': 'Content-Type, Authorization, X-Requested-With',
+  'access-control-max-age': '86400',
+  vary: 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+};
+
+function addCorsHeaders(headers = {}) {
+  return { ...corsHeaders, ...headers };
+}
 
 const json = (body, status = 200) => new Response(JSON.stringify(body), {
   status,
@@ -105,8 +116,19 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       const url = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
       const user = getLocalUser();
 
+      if (request.method === 'OPTIONS') {
+        response.writeHead(204, addCorsHeaders({
+          'content-length': '0'
+        }));
+        response.end();
+        return;
+      }
+
       if (url.pathname === '/api/session') {
-        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
         response.end(JSON.stringify({ user }));
         return;
       }
@@ -115,7 +137,10 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         if (request.method === 'GET') {
           const row = db.prepare("SELECT json, updated_at AS updatedAt, updated_by AS updatedBy FROM rd_app_state WHERE key='main'").get();
           const payload = row ? { state: JSON.parse(row.json), updatedAt: row.updatedAt, updatedBy: row.updatedBy } : { empty: true, user };
-          response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          response.writeHead(200, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store'
+          }));
           response.end(JSON.stringify(payload));
           return;
         }
@@ -133,34 +158,48 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           db.prepare("INSERT INTO rd_app_state (key, json, updated_at, updated_by) VALUES ('main', ?, ?, ?) ON CONFLICT(key) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at, updated_by=excluded.updated_by").run(body, now, user.email);
           db.prepare("INSERT INTO rd_audit_log (email, action, created_at) VALUES (?, ?, ?)").run(user.email, 'update_state', now);
 
-          response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          response.writeHead(200, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store'
+          }));
           response.end(JSON.stringify({ ok: true, updatedAt: now, updatedBy: user.email }));
           return;
         }
 
-        response.writeHead(405, {'content-type': 'application/json; charset=utf-8'});
+        response.writeHead(405, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
         response.end(JSON.stringify({ error: '不支援此操作' }));
         return;
       }
 
       if (url.pathname === '/api/health') {
-        response.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
         response.end(JSON.stringify({ ok: true, status: 'healthy', port, host }));
         return;
       }
 
       if (url.pathname === '/' || url.pathname === '/app.html') {
         const html = await readFile(defaultHtmlPath, 'utf8');
-        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
         response.end(html);
         return;
       }
 
-      response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      response.writeHead(404, addCorsHeaders({
+        'content-type': 'text/plain; charset=utf-8'
+      }));
       response.end('Not found');
     } catch (error) {
       console.error('request failed', error);
-      response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+      response.writeHead(500, addCorsHeaders({
+        'content-type': 'application/json; charset=utf-8'
+      }));
       response.end(JSON.stringify({ error: '服務暫時無法使用' }));
     }
   });

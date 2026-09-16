@@ -25,3 +25,29 @@ test('local deployment server exposes session and state endpoints', async () => 
     await close();
   }
 });
+
+test('local deployment server handles browser preflight requests for LAN usage', async () => {
+  const { server, close } = await createServer({
+    host: '127.0.0.1',
+    port: 0,
+    dbPath: ':memory:'
+  });
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const preflight = await fetch(`${baseUrl}/api/state`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'http://192.168.1.20:3000',
+        'Access-Control-Request-Method': 'PUT',
+        'Access-Control-Request-Headers': 'content-type'
+      }
+    });
+
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-origin'), '*');
+    assert.match(preflight.headers.get('access-control-allow-methods') || '', /PUT/i);
+  } finally {
+    await close();
+  }
+});

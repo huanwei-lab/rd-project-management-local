@@ -186,6 +186,43 @@ function setSync(state,label){
 function setAuthLabel(){
   authButton.textContent=sharedSession?'登出':'登入';
 }
+function ensureInputModal(){
+  let modal=document.querySelector('#inputModal');
+  if(modal)return modal;
+  modal=document.createElement('div');
+  modal.id='inputModal';
+  modal.className='modal-bg';
+  modal.innerHTML='<form class="modal" id="inputModalForm"><h2 id="inputModalTitle">輸入資料</h2><div class="field"><label id="inputModalLabel"></label><input id="inputModalValue"></div><div class="modal-actions"><button type="button" class="btn" id="inputModalCancel">取消</button><button class="btn primary" id="inputModalSubmit">確定</button></div></form>';
+  document.body.appendChild(modal);
+  return modal;
+}
+function promptInput(label,defaultValue=''){
+  const modal=ensureInputModal();
+  const title=$('#inputModalTitle');
+  const promptLabel=$('#inputModalLabel');
+  const input=$('#inputModalValue');
+  const cancel=$('#inputModalCancel');
+  const form=$('#inputModalForm');
+  title.textContent='請輸入';
+  promptLabel.textContent=label;
+  input.value=defaultValue;
+  show('#inputModal');
+  input.focus();
+  input.select();
+  return new Promise((resolve)=>{
+    const cleanup=(value)=>{
+      form.onsubmit=null;
+      cancel.onclick=null;
+      closeAll();
+      resolve(value);
+    };
+    form.onsubmit=(e)=>{
+      e.preventDefault();
+      cleanup(input.value.trim());
+    };
+    cancel.onclick=()=>cleanup('');
+  });
+}
 async function fetchUsers(){
   const response=await fetch('/api/login/options',{headers:{accept:'application/json'}});
   const data=await response.json();
@@ -202,7 +239,7 @@ async function loginPrompt(){
   const users=await fetchUsers();
   const defaultEmail=users[0].email;
   const choices=users.map(u=>`${u.displayName} <${u.email}> (${u.accessRole})`).join('\n');
-  const email=(prompt(`請輸入登入 Email：\n${choices}`,defaultEmail)||'').trim().toLowerCase();
+  const email=(await promptInput(`請輸入登入 Email（可用帳號）\n${choices}`,defaultEmail)).trim().toLowerCase();
   if(!email)return false;
   const response=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})});
   const data=await response.json();
@@ -274,60 +311,56 @@ async function listUsers(){
 }
 async function manageAccounts(){
   if(!sharedSession||sharedSession.accessRole!=='admin'){
-    alert('只有管理者可以使用帳號管理');
+    toast('只有管理者可以使用帳號管理');
     return;
   }
 
   const users=await listUsers();
-  const action=(prompt(`帳號管理\n${formatUsers(users)}\n\n輸入 add / edit / delete / audit`,'add')||'').trim().toLowerCase();
+  const action=(await promptInput(`帳號管理\n${formatUsers(users)}\n\n輸入 add / edit / delete / audit`,'add')).trim().toLowerCase();
   if(!action)return;
 
   if(action==='add'){
-    const email=(prompt('新帳號 Email')||'').trim().toLowerCase();
-    const displayName=(prompt('顯示名稱')||'').trim();
-    const accessRole=(prompt('角色：admin/pm/pe/ce/me/sme/qe/viewer','viewer')||'').trim().toLowerCase();
+    const email=(await promptInput('新帳號 Email')).trim().toLowerCase();
+    const displayName=(await promptInput('顯示名稱')).trim();
+    const accessRole=(await promptInput('角色：admin/pm/pe/ce/me/sme/qe/viewer','viewer')).trim().toLowerCase();
     if(!email||!displayName||!accessRole)return;
     await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole})});
-    alert('帳號已新增');
+    toast('帳號已新增');
     return;
   }
 
   if(action==='edit'){
-    const target=(prompt('要修改的帳號 Email')||'').trim().toLowerCase();
+    const target=(await promptInput('要修改的帳號 Email')).trim().toLowerCase();
     if(!target)return;
     const current=users.find(u=>u.email===target);
     if(!current)throw new Error('找不到此帳號');
-    const displayName=(prompt('新的顯示名稱',current.displayName)||'').trim();
-    const accessRole=(prompt('新的角色：admin/pm/pe/ce/me/sme/qe/viewer',current.accessRole)||'').trim().toLowerCase();
+    const displayName=(await promptInput('新的顯示名稱',current.displayName)).trim();
+    const accessRole=(await promptInput('新的角色：admin/pm/pe/ce/me/sme/qe/viewer',current.accessRole)).trim().toLowerCase();
     await apiJson(`/api/users/${encodeURIComponent(target)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({displayName,accessRole})});
-    alert('帳號已更新');
+    toast('帳號已更新');
     return;
   }
 
   if(action==='delete'){
-    const target=(prompt('要刪除的帳號 Email')||'').trim().toLowerCase();
+    const target=(await promptInput('要刪除的帳號 Email')).trim().toLowerCase();
     if(!target)return;
-    const ok=confirm(`確定刪除 ${target} 嗎？`);
-    if(!ok)return;
     await apiJson(`/api/users/${encodeURIComponent(target)}`,{method:'DELETE'});
-    alert('帳號已刪除');
+    toast('帳號已刪除');
     return;
   }
 
   if(action==='audit'){
     const data=await apiJson('/api/audit?limit=30',{headers:{accept:'application/json'}});
-    const lines=(data.logs||[]).map(x=>`#${x.id} ${x.createdAt} ${x.email} ${x.action}`).join('\n');
-    alert(lines||'目前沒有稽核紀錄');
+    const lines=(data.logs||[]).slice(0,5).map(x=>`#${x.id} ${x.email} ${x.action}`).join(' | ');
+    toast(lines||'目前沒有稽核紀錄');
     return;
   }
 
-  alert('未識別的指令，請輸入 add / edit / delete / audit');
+  toast('未識別指令，請輸入 add / edit / delete / audit');
 }
 authButton.onclick=async()=>{
   try{
     if(sharedSession){
-      const shouldLogout=confirm('確定要登出目前帳號嗎？');
-      if(!shouldLogout)return;
       await logoutSession();
       render();
       return;
@@ -338,14 +371,14 @@ authButton.onclick=async()=>{
     setSync('ready','已同步');
     render();
   }catch(error){
-    alert(error.message||'登入流程失敗');
+    toast(error.message||'登入流程失敗');
   }
 };
 adminButton.onclick=async()=>{
   try{
     await manageAccounts();
   }catch(error){
-    alert(error.message||'帳號管理失敗');
+    toast(error.message||'帳號管理失敗');
   }
 };
 const renderBeforeShared=render;
@@ -355,7 +388,7 @@ document.addEventListener('click',e=>{
   if(!card||!sharedSession||sharedSession.accessRole==='admin'||canManageCurrent())return;
   const task=current().tasks.find(t=>t.id===card.dataset.task);
   if(task&&current().members?.[task.role]!==sharedSession.displayName){
-    e.preventDefault();e.stopImmediatePropagation();alert('你只能更新自己負責的任務。');
+    e.preventDefault();e.stopImmediatePropagation();toast('你只能更新自己負責的任務。');
   }
 },true);
 (async()=>{
@@ -385,7 +418,7 @@ document.addEventListener('click',e=>{
     }
     sharedLoading=false;setSync('ready','已同步');render();
   }catch(error){
-    sharedLoading=true;setSync('error','連線失敗');$('#syncName').textContent='無法登入';alert(error.message);
+    sharedLoading=true;setSync('error','連線失敗');$('#syncName').textContent='無法登入';toast(error.message||'登入失敗');
   }
 })();
 </script><script>document.title='研發部專案管理';document.querySelector('.brand-text').textContent='研發部專案管理';</script></body></html>

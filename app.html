@@ -236,12 +236,10 @@ async function apiJson(url,options={}){
   return data;
 }
 async function loginPrompt(){
-  const users=await fetchUsers();
-  const defaultEmail=users[0].email;
-  const choices=users.map(u=>`${u.displayName} <${u.email}>`).join('\n');
-  const email=(await promptInput(`請輸入登入 Email\n${choices}`,defaultEmail)).trim().toLowerCase();
+  // Security: Do NOT expose account list during login (prevents account enumeration)
+  const email=(await promptInput('請輸入登入 Email:','')).trim().toLowerCase();
   if(!email)return false;
-  const password=await promptInput('請輸入密碼','');
+  const password=await promptInput('請輸入密碼:','');
   if(!password)return false;
   const response=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,password})});
   const data=await response.json();

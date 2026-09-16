@@ -8,3 +8,5 @@ coverage/
 db/*.sqlite
 db/backups/
 server/.tmp/
+handoff/
+.handoff-backups/

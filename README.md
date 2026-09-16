@@ -57,6 +57,21 @@ LOCAL_ADMIN_ROLE=admin
 - 稽核紀錄（登入、登出、資料更新、帳號異動）
 - 支援匯出 / 匯入備份 JSON
 - 可直接在 LAN 中由多台電腦使用
+- 支援 Cloud/Local 雙軌交接流程（Manager/IT）
+
+## 雙軌交接（推薦）
+
+- 交給開發經理（雲端可預覽）
+	- `node scripts/make-cloud-manager-bundle.mjs`
+	- 產出：`handoff/cloud-manager-bundle/`
+- 經理回傳原始碼後套用
+	- `node scripts/apply-manager-return.mjs <manager_folder_path>`
+	- 會自動備份舊檔到 `.handoff-backups/<timestamp>/`
+- IT 打包本地部署版本
+	- `node scripts/make-it-local-bundle.mjs`
+	- 產出：`handoff/it-local-bundle/`
+
+完整流程請見：`ARCHITECTURE_WORKFLOW.md`
 
 ## 登入與登出
 
@@ -79,6 +94,11 @@ npm run validate
 npm test
 npm run test:lan
 npm run backup:db
+npm run handoff:cloud
+npm run handoff:cloud:zip
+npm run handoff:apply -- <manager_folder_path>
+npm run handoff:it
+npm run handoff:it:zip
 ```
 
 ## 帳號管理

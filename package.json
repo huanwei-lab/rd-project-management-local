@@ -5,9 +5,15 @@
   "scripts": {
     "start": "node server/local-server.mjs",
     "build": "node scripts/build.mjs",
+    "build:cloud": "node scripts/build.mjs",
     "validate": "node scripts/validate-artifact.mjs",
     "test": "node --test tests/*.test.mjs",
     "test:lan": "node scripts/lan-diagnostic.mjs",
-    "backup:db": "node scripts/backup-db.mjs"
+    "backup:db": "node scripts/backup-db.mjs",
+    "handoff:cloud": "node scripts/make-cloud-manager-bundle.mjs",
+    "handoff:cloud:zip": "node scripts/make-cloud-manager-bundle.mjs ; node scripts/zip-bundle.mjs handoff/cloud-manager-bundle handoff/cloud-manager-bundle.zip",
+    "handoff:apply": "node scripts/apply-manager-return.mjs",
+    "handoff:it": "node scripts/make-it-local-bundle.mjs",
+    "handoff:it:zip": "node scripts/make-it-local-bundle.mjs ; node scripts/zip-bundle.mjs handoff/it-local-bundle handoff/it-local-bundle.zip"
   }
 }

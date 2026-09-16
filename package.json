@@ -1,0 +1,11 @@
+{
+  "name": "engineering-project-hub-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server/local-server.mjs",
+    "build": "node scripts/build.mjs",
+    "validate": "node scripts/validate-artifact.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

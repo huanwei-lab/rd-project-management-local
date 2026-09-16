@@ -1,0 +1,12 @@
+import { readFile, writeFile, mkdir, rm, cp } from "node:fs/promises";
+const root=new URL("../",import.meta.url);
+const page=await readFile(new URL("app.html",root),"utf8");
+const source=await readFile(new URL("worker/index.js",root),"utf8");
+const encoded=Buffer.from(page,"utf8").toString("base64");
+await rm(new URL("dist",root),{recursive:true,force:true});
+await mkdir(new URL("dist/server",root),{recursive:true});
+await mkdir(new URL("dist/.openai/drizzle",root),{recursive:true});
+await writeFile(new URL("dist/server/index.js",root),source.replace("__APP_HTML_BASE64__",encoded));
+await cp(new URL(".openai/hosting.json",root),new URL("dist/.openai/hosting.json",root));
+await cp(new URL(".openai/drizzle",root),new URL("dist/.openai/drizzle",root),{recursive:true});
+console.log("Built shared project-management Worker");

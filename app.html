@@ -304,7 +304,13 @@ function applySharedPermissions(){
 }
 async function listUsers(){
   const data=await apiJson('/api/users',{headers:{accept:'application/json'}});
-  return data.users||[];
+  return (data.users||[]).map((u)=>({
+    email:u.email,
+    displayName:u.displayName,
+    accessRole:u.accessRole,
+    enabled:u.enabled!==0,
+    lastLoginAt:u.lastLoginAt
+  }));
 }
 
 function ensureAccountModal(){
@@ -316,21 +322,30 @@ function ensureAccountModal(){
   modal.innerHTML='\
   <div class="modal" style="max-width:920px;width:min(96vw,920px)">\
     <h2>帳號管理</h2>\
-    <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:14px;align-items:start">\
+    <div style="display:grid;grid-template-columns:1.2fr 1.2fr;gap:14px;align-items:start">\
       <div style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff">\
-        <div style="display:grid;grid-template-columns:1.1fr 1.2fr .7fr;background:#f7f8fb;padding:9px 10px;font-size:.75rem;color:var(--muted)">\
-          <span>姓名</span><span>Email</span><span>角色</span>\
+        <div style="display:grid;grid-template-columns:1fr 1.5fr .6fr;background:#f7f8fb;padding:9px 10px;font-size:.73rem;color:var(--muted)">\
+          <span>姓名</span><span>Email</span><span>狀態</span>\
         </div>\
-        <div id="accountRows" style="max-height:280px;overflow:auto"></div>\
+        <div id="accountRows" style="max-height:340px;overflow:auto"></div>\
       </div>\
       <div>\
         <div class="field"><label>顯示名稱</label><input id="accountNameInput" placeholder="例如：王小明"></div>\
-        <div class="field"><label>Email</label><input id="accountEmailInput" placeholder="name@company.com"></div>\
+        <div class="field"><label>Email</label><input id="accountEmailInput" placeholder="name@company.com" readonly></div>\
         <div class="field"><label>角色</label><select id="accountRoleInput"><option>admin</option><option>pm</option><option>pe</option><option>ce</option><option>me</option><option>sme</option><option>qe</option><option selected>viewer</option></select></div>\
-        <div class="modal-actions" style="margin-top:6px">\
-          <button type="button" class="btn" id="accountNewBtn">新增模式</button>\
+        <div style="padding:8px;background:#f7f8fb;border-radius:6px;font-size:.75rem;color:#666;margin:8px 0">\
+          <div id="accountStatusBox">最後登入：未知</div>\
+        </div>\
+        <div class="modal-actions" style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px">\
+          <button type="button" class="btn" id="accountNewBtn">新增</button>\
           <button type="button" class="btn primary" id="accountSaveBtn">儲存</button>\
-          <button type="button" class="btn danger" id="accountDeleteBtn">刪除</button>\
+        </div>\
+        <div class="modal-actions" style="margin-top:4px;display:grid;grid-template-columns:1fr 1fr;gap:4px">\
+          <button type="button" class="btn" id="accountToggleBtn">禁用</button>\
+          <button type="button" class="btn danger" id="accountLogoutBtn">強制登出</button>\
+        </div>\
+        <div class="modal-actions" style="margin-top:4px">\
+          <button type="button" class="btn danger" id="accountDeleteBtn" style="width:100%">刪除帳號</button>\
         </div>\
       </div>\
     </div>\
@@ -357,7 +372,7 @@ function accountState(){
 function renderAccountRows(){
   const state=accountState();
   const rows=$('#accountRows');
-  rows.innerHTML=state.users.map((user)=>`<button type="button" data-account-email="${esc(user.email)}" style="display:grid;grid-template-columns:1.1fr 1.2fr .7fr;width:100%;text-align:left;border:0;border-top:1px solid #eef0f4;background:${state.selectedEmail===user.email?'#f0f4ff':'#fff'};padding:9px 10px;font:inherit;cursor:pointer"><span>${esc(user.displayName)}</span><span>${esc(user.email)}</span><span>${esc(user.accessRole)}</span></button>`).join('')||'<div style="padding:14px;color:var(--muted)">目前沒有帳號</div>';
+  rows.innerHTML=state.users.map((user)=>`<button type="button" data-account-email="${esc(user.email)}" style="display:grid;grid-template-columns:1fr 1.5fr .6fr;width:100%;text-align:left;border:0;border-top:1px solid #eef0f4;background:${state.selectedEmail===user.email?'#f0f4ff':'#fff'};padding:9px 10px;font:inherit;cursor:pointer;align-items:center"><span>${esc(user.displayName)}</span><span style="font-size:.85em;color:#999">${esc(user.email)}</span><span style="font-size:.75em;${user.enabled?'color:#4a9eff':'color:#f0ad4e'}">${user.enabled?'啟用':'禁用'}</span></button>`).join('')||'<div style="padding:14px;color:var(--muted)">目前沒有帳號</div>';
 }
 
 function fillAccountForm(user){
@@ -365,6 +380,20 @@ function fillAccountForm(user){
   $('#accountEmailInput').value=user?.email||'';
   $('#accountEmailInput').readOnly=Boolean(user?.email);
   $('#accountRoleInput').value=user?.accessRole||'viewer';
+  const statusEl=$('#accountStatusBox');
+  if(user){
+    const lastLogin=user.lastLoginAt?new Date(user.lastLoginAt).toLocaleString():'從未登入';
+    statusEl.textContent=`最後登入：${lastLogin}`;
+    $('#accountToggleBtn').textContent=user.enabled?'禁用':'啟用';
+    $('#accountToggleBtn').disabled=false;
+    $('#accountLogoutBtn').disabled=false;
+    $('#accountDeleteBtn').disabled=false;
+  }else{
+    statusEl.textContent='最後登入：-';
+    $('#accountToggleBtn').disabled=true;
+    $('#accountLogoutBtn').disabled=true;
+    $('#accountDeleteBtn').disabled=true;
+  }
 }
 
 async function refreshAudit(){
@@ -375,7 +404,14 @@ async function refreshAudit(){
 
 async function refreshUsersAndRender(){
   const state=accountState();
-  state.users=await listUsers();
+  const data=await apiJson('/api/users',{headers:{accept:'application/json'}});
+  state.users=(data.users||[]).map((u)=>({
+    email:u.email,
+    displayName:u.displayName,
+    accessRole:u.accessRole,
+    enabled:u.enabled!==0,
+    lastLoginAt:u.lastLoginAt
+  }));
   if(!state.users.some((user)=>user.email===state.selectedEmail)){
     state.selectedEmail='';
   }
@@ -420,6 +456,29 @@ function bindAccountModalEvents(){
     }
 
     await refreshUsersAndRender();
+    await refreshAudit();
+  };
+
+  $('#accountToggleBtn').onclick=async()=>{
+    if(!state.selectedEmail){
+      toast('請先選擇要啟用/禁用的帳號');
+      return;
+    }
+    const result=await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}/toggle-enable`,{method:'POST'});
+    toast(result.enabled?'帳號已啟用':'帳號已禁用');
+    await refreshUsersAndRender();
+    const user=state.users.find((u)=>u.email===state.selectedEmail);
+    fillAccountForm(user);
+    await refreshAudit();
+  };
+
+  $('#accountLogoutBtn').onclick=async()=>{
+    if(!state.selectedEmail){
+      toast('請先選擇要強制登出的帳號');
+      return;
+    }
+    await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}/force-logout`,{method:'POST'});
+    toast('已強制登出該帳號的所有 session');
     await refreshAudit();
   };
 

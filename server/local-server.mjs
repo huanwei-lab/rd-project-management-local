@@ -66,6 +66,17 @@ function initializeDatabase(db) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS rd_app_user_security (
+      email TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_login_at TEXT,
+      login_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_until TEXT,
+      password_hash TEXT,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (email) REFERENCES rd_app_users(email) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS rd_audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL,
@@ -88,6 +99,9 @@ function initializeDatabase(db) {
   db.prepare(
     'INSERT OR IGNORE INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)'
   ).run(adminEmail, adminDisplayName, adminRole, now);
+  db.prepare(
+    'INSERT OR IGNORE INTO rd_app_user_security (email, enabled, updated_at) VALUES (?, ?, ?)'
+  ).run(adminEmail, 1, now);
 
   const extraUsersJson = process.env.LOCAL_USERS_JSON;
   if (extraUsersJson) {
@@ -105,6 +119,15 @@ function initializeDatabase(db) {
             continue;
           }
           insertUser.run(email, displayName, accessRole, now);
+        }
+      }
+      const insertSecurity = db.prepare(
+        'INSERT OR IGNORE INTO rd_app_user_security (email, enabled, updated_at) VALUES (?, ?, ?)'
+      );
+      for (const user of extraUsers) {
+        const email = user?.email?.trim()?.toLowerCase();
+        if (email && allowedRoles.has(user?.accessRole?.trim()?.toLowerCase())) {
+          insertSecurity.run(email, 1, now);
         }
       }
     } catch (error) {
@@ -167,9 +190,10 @@ function getSessionUser(request, db) {
 
   const now = new Date().toISOString();
   const row = db.prepare(
-    `SELECT u.email, u.display_name, u.access_role, s.expires_at
+    `SELECT u.email, u.display_name, u.access_role, s.expires_at, sec.enabled, sec.locked_until
      FROM rd_app_sessions s
      JOIN rd_app_users u ON u.email = s.email
+     LEFT JOIN rd_app_user_security sec ON u.email = sec.email
      WHERE s.token = ?`
   ).get(sessionToken);
 
@@ -179,6 +203,15 @@ function getSessionUser(request, db) {
 
   if (row.expires_at <= now) {
     db.prepare('DELETE FROM rd_app_sessions WHERE token = ?').run(sessionToken);
+    return null;
+  }
+
+  if (row.enabled === 0) {
+    db.prepare('DELETE FROM rd_app_sessions WHERE token = ?').run(sessionToken);
+    return null;
+  }
+
+  if (row.locked_until && row.locked_until > now) {
     return null;
   }
 
@@ -366,7 +399,13 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
-        const users = db.prepare('SELECT email, display_name AS displayName, access_role AS accessRole, created_at AS createdAt FROM rd_app_users ORDER BY created_at ASC, email ASC').all();
+        const users = db.prepare(`
+          SELECT u.email, u.display_name AS displayName, u.access_role AS accessRole, u.created_at AS createdAt,
+                 COALESCE(sec.enabled, 1) AS enabled, sec.last_login_at AS lastLoginAt
+          FROM rd_app_users u
+          LEFT JOIN rd_app_user_security sec ON u.email = sec.email
+          ORDER BY u.created_at ASC, u.email ASC
+        `).all();
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store'
@@ -503,11 +542,66 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
 
         db.prepare('DELETE FROM rd_app_users WHERE email=?').run(targetEmail);
         db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
+        db.prepare('DELETE FROM rd_app_user_security WHERE email=?').run(targetEmail);
         appendAudit(db, user.email, `delete_user:${targetEmail}`);
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
         response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/users/') && url.pathname.endsWith('/force-logout') && request.method === 'POST') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+        const targetEmail = decodeURIComponent(url.pathname.slice('/api/users/'.length, -'/force-logout'.length)).trim().toLowerCase();
+        db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
+        appendAudit(db, user.email, `force_logout:${targetEmail}`);
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/users/') && url.pathname.endsWith('/toggle-enable') && request.method === 'POST') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+        const targetEmail = decodeURIComponent(url.pathname.slice('/api/users/'.length, -'/toggle-enable'.length)).trim().toLowerCase();
+        const existing = getUserByEmail(db, targetEmail);
+        if (!existing) {
+          response.writeHead(404, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '找不到此帳號' }));
+          return;
+        }
+        const secRow = db.prepare('SELECT enabled FROM rd_app_user_security WHERE email = ?').get(targetEmail);
+        const nextEnabled = (secRow?.enabled ?? 1) === 0 ? 1 : 0;
+        const now = new Date().toISOString();
+        if (secRow) {
+          db.prepare('UPDATE rd_app_user_security SET enabled = ?, updated_at = ? WHERE email = ?').run(nextEnabled, now, targetEmail);
+        } else {
+          db.prepare('INSERT INTO rd_app_user_security (email, enabled, updated_at) VALUES (?, ?, ?)').run(targetEmail, nextEnabled, now);
+        }
+        if (nextEnabled === 0) {
+          db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
+        }
+        appendAudit(db, user.email, `toggle_enable:${targetEmail}:${nextEnabled ? 'enabled' : 'disabled'}`);
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
+        response.end(JSON.stringify({ ok: true, enabled: nextEnabled }));
         return;
       }
 
@@ -542,8 +636,46 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        const now = new Date().toISOString();
+        const secRow = db.prepare(
+          `SELECT enabled, locked_until, login_attempts FROM rd_app_user_security WHERE email = ?`
+        ).get(email);
+
+        const enabled = secRow?.enabled ?? 1;
+        const lockedUntil = secRow?.locked_until;
+        const loginAttempts = secRow?.login_attempts ?? 0;
+
+        if (enabled === 0) {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '此帳號已被禁用' }));
+          return;
+        }
+
+        if (lockedUntil && lockedUntil > now) {
+          response.writeHead(429, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '登入嘗試過多，請稍候' }));
+          return;
+        }
+
         const token = createSession(db, nextUser.email);
         appendAudit(db, nextUser.email, 'login');
+        // Ensure security record exists
+        const secExists = db.prepare('SELECT 1 FROM rd_app_user_security WHERE email = ?').get(nextUser.email);
+        if (secExists) {
+          db.prepare(
+            `UPDATE rd_app_user_security SET login_attempts = 0, last_login_at = ?, locked_until = NULL 
+             WHERE email = ?`
+          ).run(now, nextUser.email);
+        } else {
+          db.prepare(
+            `INSERT INTO rd_app_user_security (email, enabled, last_login_at, login_attempts, updated_at) 
+             VALUES (?, 1, ?, 0, ?)`
+          ).run(nextUser.email, now, now);
+        }
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',

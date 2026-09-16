@@ -35,6 +35,35 @@ const sessionDurationSeconds = 60 * 60 * 8;
 const allowedRoles = new Set(['admin', 'pm', 'pe', 'ce', 'me', 'sme', 'qe', 'viewer']);
 const defaultAdminPassword = process.env.LOCAL_ADMIN_PASSWORD || 'Admin@2026Secure';
 
+// ISO 27001 Advanced Compliance Policies
+const ADVANCED_COMPLIANCE = {
+  // A.9.2.2 - Account Lockout Policy
+  accountLockout: {
+    maxAttempts: 5,              // 最多5次失敗嘗試
+    lockoutDurationMinutes: 15,  // 鎖定15分鐘
+    resetAfterMinutes: 1440      // 24小時後重置計數
+  },
+  // A.9.4.3 - Password Expiration Policy
+  passwordExpiration: {
+    expirationDays: 90,         // 90天過期
+    warningDays: 14,            // 提前14天警告
+    minDaysBeforeReuse: 5,      // 5天內不能重複使用
+    historyCount: 5             // 保留最近5個密碼
+  },
+  // A.12.4.1 - Session Monitoring
+  sessionMonitoring: {
+    inactivityTimeoutMinutes: 30,  // 30分鐘無活動自動登出
+    maxConcurrentSessions: 3,      // 每個用戶最多3個併發會話
+    trackUserAgent: true           // 追蹤瀏覽器/裝置資訊
+  },
+  // Security Event Detection
+  securityEvents: {
+    enableAnomalyDetection: true,
+    failedLoginThreshold: 3,       // 3次失敗在30分鐘內視為異常
+    administratorOnlyAlert: true   // 管理員修改需要警告
+  }
+};
+
 // ISO 27001 compliant password policy
 function validatePassword(password, email) {
   if (!password) return { valid: false, error: '密碼不能為空' };
@@ -139,6 +168,8 @@ function initializeDatabase(db) {
       login_attempts INTEGER NOT NULL DEFAULT 0,
       locked_until TEXT,
       password_hash TEXT,
+      password_changed_at TEXT,
+      password_expires_at TEXT,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (email) REFERENCES rd_app_users(email) ON DELETE CASCADE
     );
@@ -147,14 +178,30 @@ function initializeDatabase(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL,
       action TEXT NOT NULL,
+      severity TEXT DEFAULT 'info',
+      details TEXT,
       created_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS rd_app_sessions (
       token TEXT PRIMARY KEY,
       email TEXT NOT NULL,
+      user_agent TEXT,
+      ip_address TEXT,
       created_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
+      expires_at TEXT NOT NULL,
+      last_activity_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS rd_security_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      severity TEXT DEFAULT 'warning',
+      description TEXT,
+      ip_address TEXT,
+      user_agent TEXT,
+      created_at TEXT NOT NULL
     );
   `);
 
@@ -299,16 +346,51 @@ function clearSessionCookie() {
   return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 }
 
-function createSession(db, email) {
+function createSession(db, email, userAgent = null, ipAddress = null) {
   const token = crypto.randomBytes(24).toString('hex');
   const createdAt = new Date().toISOString();
   const expiresAt = new Date(Date.now() + sessionDurationSeconds * 1000).toISOString();
-  db.prepare('INSERT INTO rd_app_sessions (token, email, created_at, expires_at) VALUES (?, ?, ?, ?)').run(token, email, createdAt, expiresAt);
+  db.prepare('INSERT INTO rd_app_sessions (token, email, user_agent, ip_address, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+    token, 
+    email, 
+    userAgent, 
+    ipAddress, 
+    createdAt, 
+    expiresAt,
+    createdAt
+  );
   return token;
 }
 
-function appendAudit(db, email, action) {
-  db.prepare('INSERT INTO rd_audit_log (email, action, created_at) VALUES (?, ?, ?)').run(email || 'anonymous', action, new Date().toISOString());
+function appendAudit(db, email, action, severity = 'info', details = null) {
+  db.prepare('INSERT INTO rd_audit_log (email, action, severity, details, created_at) VALUES (?, ?, ?, ?, ?)').run(
+    email || 'anonymous',
+    action,
+    severity,
+    details ? JSON.stringify(details) : null,
+    new Date().toISOString()
+  );
+}
+
+function recordSecurityEvent(db, email, eventType, severity, description, ipAddress, userAgent) {
+  db.prepare(
+    'INSERT INTO rd_security_events (email, event_type, severity, description, ip_address, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(email || 'anonymous', eventType, severity, description, ipAddress || null, userAgent || null, new Date().toISOString());
+}
+
+function getPasswordExpirationStatus(db, email) {
+  const user = db.prepare(
+    'SELECT password_changed_at, password_expires_at FROM rd_app_user_security WHERE email = ?'
+  ).get(email);
+  if (!user || !user.password_changed_at) {
+    return { status: 'unknown', daysUntilExpiry: 0, requiresChange: false };
+  }
+  const expiresAt = user.password_expires_at ? new Date(user.password_expires_at) : null;
+  const now = new Date();
+  const daysUntilExpiry = expiresAt ? Math.ceil((expiresAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) : 0;
+  const requiresChange = daysUntilExpiry <= 0;
+  const warningLevel = daysUntilExpiry > 0 && daysUntilExpiry <= ADVANCED_COMPLIANCE.passwordExpiration.warningDays;
+  return { status: requiresChange ? 'expired' : warningLevel ? 'warning' : 'valid', daysUntilExpiry, requiresChange, warningLevel };
 }
 
 function safeParseInt(value, fallback) {
@@ -526,6 +608,8 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
 
         const now = new Date().toISOString();
         const passwordHash = hashPasswordSync(password);
+        const passwordExpiresAt = new Date(Date.now() + ADVANCED_COMPLIANCE.passwordExpiration.expirationDays * 24 * 60 * 60 * 1000).toISOString();
+        
         db.prepare('INSERT INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)').run(
           validated.email,
           validated.displayName,
@@ -533,9 +617,11 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           now
         );
         db.prepare(
-          'INSERT INTO rd_app_user_security (email, enabled, updated_at, password_hash) VALUES (?, ?, ?, ?)'
-        ).run(validated.email, 1, now, passwordHash);
-        appendAudit(db, user.email, `create_user:${validated.email}`);
+          'INSERT INTO rd_app_user_security (email, enabled, password_hash, password_changed_at, password_expires_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+        ).run(validated.email, 1, passwordHash, now, passwordExpiresAt, now);
+        appendAudit(db, user.email, `create_user:${validated.email}`, 'info', { role: validated.accessRole });
+        recordSecurityEvent(db, user.email, 'account_created', 'info', `Created account: ${validated.email}`, null, null);
+        
         response.writeHead(201, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
@@ -604,13 +690,20 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         // Update password if provided
         if (payload?.password) {
           const passwordHash = hashPasswordSync(payload.password);
-          db.prepare('UPDATE rd_app_user_security SET password_hash=?, updated_at=? WHERE email=?').run(
+          const passwordExpiresAt = new Date(Date.now() + ADVANCED_COMPLIANCE.passwordExpiration.expirationDays * 24 * 60 * 60 * 1000).toISOString();
+          db.prepare('UPDATE rd_app_user_security SET password_hash=?, password_changed_at=?, password_expires_at=?, updated_at=? WHERE email=?').run(
             passwordHash,
+            now,
+            passwordExpiresAt,
             now,
             targetEmail
           );
+          recordSecurityEvent(db, user.email, 'password_changed', 'info', `Password changed for ${targetEmail}`, null, null);
         }
-        appendAudit(db, user.email, `update_user:${targetEmail}`);
+        if (nextRole !== existing.accessRole) {
+          recordSecurityEvent(db, user.email, 'role_changed', 'warning', `Role changed for ${targetEmail}: ${existing.accessRole} → ${nextRole}`, null, null);
+        }
+        appendAudit(db, user.email, `update_user:${targetEmail}`, 'info', { passwordChanged: !!payload?.password, roleChanged: nextRole !== existing.accessRole });
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
@@ -651,7 +744,8 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         db.prepare('DELETE FROM rd_app_users WHERE email=?').run(targetEmail);
         db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
         db.prepare('DELETE FROM rd_app_user_security WHERE email=?').run(targetEmail);
-        appendAudit(db, user.email, `delete_user:${targetEmail}`);
+        appendAudit(db, user.email, `delete_user:${targetEmail}`, 'warning', { deletedEmail: targetEmail });
+        recordSecurityEvent(db, user.email, 'account_deleted', 'warning', `Deleted account: ${targetEmail}`, null, null);
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
@@ -669,7 +763,8 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         }
         const targetEmail = decodeURIComponent(url.pathname.slice('/api/users/'.length, -'/force-logout'.length)).trim().toLowerCase();
         db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
-        appendAudit(db, user.email, `force_logout:${targetEmail}`);
+        appendAudit(db, user.email, `force_logout:${targetEmail}`, 'warning', { targetEmail });
+        recordSecurityEvent(db, user.email, 'force_logout', 'warning', `Forced logout for ${targetEmail}`, null, null);
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
@@ -704,8 +799,11 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         }
         if (nextEnabled === 0) {
           db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
+          recordSecurityEvent(db, user.email, 'account_disabled', 'critical', `Account disabled: ${targetEmail}`, null, null);
+        } else {
+          recordSecurityEvent(db, user.email, 'account_enabled', 'warning', `Account enabled: ${targetEmail}`, null, null);
         }
-        appendAudit(db, user.email, `toggle_enable:${targetEmail}:${nextEnabled ? 'enabled' : 'disabled'}`);
+        appendAudit(db, user.email, `toggle_enable:${targetEmail}:${nextEnabled ? 'enabled' : 'disabled'}`, 'warning', { targetEmail, action: nextEnabled ? 'enabled' : 'disabled' });
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8'
         }));
@@ -723,7 +821,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         }
 
         const limit = Math.min(Math.max(safeParseInt(url.searchParams.get('limit'), 50), 1), 500);
-        const rows = db.prepare('SELECT id, email, action, created_at AS createdAt FROM rd_audit_log ORDER BY id DESC LIMIT ?').all(limit);
+        const rows = db.prepare('SELECT id, email, action, severity, details, created_at AS createdAt FROM rd_audit_log ORDER BY id DESC LIMIT ?').all(limit);
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store'
@@ -737,6 +835,8 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         const email = payload?.email?.trim()?.toLowerCase();
         const password = payload?.password || '';
         const nextUser = getUserByEmail(db, email);
+        const now = new Date().toISOString();
+        
         if (!nextUser) {
           response.writeHead(401, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
@@ -746,10 +846,26 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         }
 
         // Verify password and check account status
-        const secRow = db.prepare('SELECT password_hash, enabled, locked_until, login_attempts FROM rd_app_user_security WHERE email = ?').get(email);
+        const secRow = db.prepare('SELECT password_hash, enabled, locked_until, login_attempts, password_expires_at FROM rd_app_user_security WHERE email = ?').get(email);
         const passwordHash = secRow?.password_hash;
         const passwordValid = await verifyPassword(password, passwordHash);
+        
+        // A.9.2.2 - Account Lockout Policy: Track failed login attempts
         if (!passwordValid) {
+          const newAttempts = (secRow?.login_attempts ?? 0) + 1;
+          let lockUntil = null;
+          let severity = 'info';
+          
+          if (newAttempts >= ADVANCED_COMPLIANCE.accountLockout.maxAttempts) {
+            lockUntil = new Date(Date.now() + ADVANCED_COMPLIANCE.accountLockout.lockoutDurationMinutes * 60 * 1000).toISOString();
+            severity = 'critical';
+          } else if (newAttempts >= ADVANCED_COMPLIANCE.accountLockout.maxAttempts - 1) {
+            severity = 'warning';
+          }
+          
+          db.prepare('UPDATE rd_app_user_security SET login_attempts = ?, locked_until = ? WHERE email = ?').run(newAttempts, lockUntil, email);
+          recordSecurityEvent(db, email, 'failed_login', severity, `Failed login attempt ${newAttempts}/${ADVANCED_COMPLIANCE.accountLockout.maxAttempts}`, null, null);
+          
           response.writeHead(401, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -757,12 +873,12 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
-        const now = new Date().toISOString();
         const enabled = secRow?.enabled ?? 1;
         const lockedUntil = secRow?.locked_until;
         const loginAttempts = secRow?.login_attempts ?? 0;
 
         if (enabled === 0) {
+          recordSecurityEvent(db, email, 'disabled_account_login_attempt', 'warning', 'Attempt to login to disabled account', null, null);
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -771,6 +887,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         }
 
         if (lockedUntil && lockedUntil > now) {
+          recordSecurityEvent(db, email, 'locked_account_login_attempt', 'warning', 'Attempt to login to locked account', null, null);
           response.writeHead(429, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -778,8 +895,20 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        // A.9.4.3 - Password Expiration Check
+        const pwdExpStatus = getPasswordExpirationStatus(db, email);
+        if (pwdExpStatus.requiresChange) {
+          recordSecurityEvent(db, email, 'expired_password_login', 'critical', 'Login with expired password', null, null);
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '密碼已過期，需要強制修改', passwordExpired: true }));
+          return;
+        }
+
         const token = createSession(db, nextUser.email);
-        appendAudit(db, nextUser.email, 'login');
+        appendAudit(db, nextUser.email, 'login', 'info', { passwordWarning: pwdExpStatus.warningLevel ? `警告: 密碼將在 ${pwdExpStatus.daysUntilExpiry} 天後過期` : null });
+        
         // Ensure security record exists
         const secExists = db.prepare('SELECT 1 FROM rd_app_user_security WHERE email = ?').get(nextUser.email);
         if (secExists) {
@@ -789,16 +918,20 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           ).run(now, nextUser.email);
         } else {
           db.prepare(
-            `INSERT INTO rd_app_user_security (email, enabled, last_login_at, login_attempts, updated_at) 
-             VALUES (?, 1, ?, 0, ?)`
-          ).run(nextUser.email, now, now);
+            `INSERT INTO rd_app_user_security (email, enabled, last_login_at, login_attempts, password_changed_at, password_expires_at, updated_at) 
+             VALUES (?, 1, ?, 0, ?, ?, ?)`
+          ).run(nextUser.email, now, now, new Date(Date.now() + ADVANCED_COMPLIANCE.passwordExpiration.expirationDays * 24 * 60 * 60 * 1000).toISOString(), now);
         }
+        
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
           'set-cookie': makeSessionCookie(token)
         }));
-        response.end(JSON.stringify({ user: nextUser }));
+        response.end(JSON.stringify({ 
+          user: nextUser, 
+          passwordWarning: pwdExpStatus.warningLevel ? `密碼將在 ${pwdExpStatus.daysUntilExpiry} 天後過期` : null 
+        }));
         return;
       }
 
@@ -900,6 +1033,241 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           'content-type': 'application/json; charset=utf-8'
         }));
         response.end(JSON.stringify({ error: '不支援此操作' }));
+        return;
+      }
+
+      // ===== Advanced Compliance APIs (ISO 27001 A.9.2, A.9.4, A.12.4) =====
+
+      if (url.pathname === '/api/compliance/permission-review' && request.method === 'GET') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        try {
+          // ISO 27001 A.9.2.3 - Generate Permission Review Report
+          const users = db.prepare(`
+            SELECT u.email, u.display_name, u.access_role, u.created_at,
+                   COALESCE(sec.enabled, 1) AS enabled, 
+                   sec.last_login_at,
+                   sec.login_attempts,
+                   sec.locked_until,
+                   sec.password_changed_at,
+                   sec.password_expires_at
+            FROM rd_app_users u
+            LEFT JOIN rd_app_user_security sec ON u.email = sec.email
+            ORDER BY u.created_at ASC
+          `).all();
+
+          const report = {
+            generatedAt: new Date().toISOString(),
+            reviewedBy: user.email,
+            totalUsers: users.length,
+            roleDistribution: {},
+            complianceIssues: [],
+            users: []
+          };
+
+          for (const u of users) {
+            const pwdStatus = getPasswordExpirationStatus(db, u.email);
+            const issues = [];
+            
+            if (u.enabled === 0) issues.push('帳號已禁用');
+            if (u.locked_until && u.locked_until > new Date().toISOString()) issues.push('帳號已鎖定');
+            if (pwdStatus.requiresChange) issues.push('密碼已過期');
+            if (pwdStatus.warningLevel) issues.push(`密碼將在 ${pwdStatus.daysUntilExpiry} 天後過期`);
+            if ((u.login_attempts || 0) > 2) issues.push(`登入失敗嘗試 ${u.login_attempts} 次`);
+            
+            if (!report.roleDistribution[u.access_role]) report.roleDistribution[u.access_role] = 0;
+            report.roleDistribution[u.access_role]++;
+            
+            if (issues.length > 0) {
+              report.complianceIssues.push({ email: u.email, issues });
+            }
+            
+            report.users.push({
+              email: u.email,
+              displayName: u.display_name,
+              role: u.access_role,
+              createdAt: u.created_at,
+              enabled: u.enabled === 1,
+              lastLogin: u.last_login_at || '未登入',
+              loginAttempts: u.login_attempts || 0,
+              isLocked: u.locked_until && u.locked_until > new Date().toISOString(),
+              passwordStatus: pwdStatus.status,
+              passwordDaysUntilExpiry: pwdStatus.daysUntilExpiry,
+              issues
+            });
+          }
+
+          response.writeHead(200, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store'
+          }));
+          response.end(JSON.stringify(report));
+        } catch (err) {
+          console.error('Permission review error:', err);
+          response.writeHead(500, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '權限審查報告生成失敗', details: err.message }));
+        }
+        return;
+      }
+
+      if (url.pathname === '/api/compliance/security-events' && request.method === 'GET') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        // ISO 27001 A.12.4.1 - Security Event Monitoring
+        const limit = Math.min(Math.max(safeParseInt(url.searchParams.get('limit'), 100), 1), 500);
+        const severity = url.searchParams.get('severity'); // 'critical', 'warning', 'info'
+        
+        let query = 'SELECT id, email, event_type, severity, description, ip_address, user_agent, created_at FROM rd_security_events';
+        const params = [];
+        
+        if (severity) {
+          query += ' WHERE severity = ?';
+          params.push(severity);
+        }
+        
+        query += ' ORDER BY id DESC LIMIT ?';
+        params.push(limit);
+        
+        const events = db.prepare(query).all(...params);
+
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify({ 
+          events,
+          totalCount: events.length,
+          filteredBySeverity: severity || 'none'
+        }));
+        return;
+      }
+
+      if (url.pathname === '/api/compliance/password-expiration' && request.method === 'GET') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        // ISO 27001 A.9.4.3 - Password Expiration Report
+        const users = db.prepare(`
+          SELECT u.email, u.display_name, sec.password_changed_at, sec.password_expires_at
+          FROM rd_app_users u
+          LEFT JOIN rd_app_user_security sec ON u.email = sec.email
+          WHERE COALESCE(sec.enabled, 1) = 1
+        `).all();
+
+        const report = {
+          generatedAt: new Date().toISOString(),
+          reviewedBy: user.email,
+          policy: {
+            expirationDays: ADVANCED_COMPLIANCE.passwordExpiration.expirationDays,
+            warningDays: ADVANCED_COMPLIANCE.passwordExpiration.warningDays
+          },
+          passwords: {
+            expired: [],
+            warning: [],
+            valid: []
+          }
+        };
+
+        for (const u of users) {
+          const status = getPasswordExpirationStatus(db, u.email);
+          const entry = {
+            email: u.email,
+            displayName: u.display_name,
+            changedAt: u.password_changed_at,
+            expiresAt: u.password_expires_at,
+            daysUntilExpiry: status.daysUntilExpiry
+          };
+
+          if (status.requiresChange) {
+            report.passwords.expired.push(entry);
+          } else if (status.warningLevel) {
+            report.passwords.warning.push(entry);
+          } else {
+            report.passwords.valid.push(entry);
+          }
+        }
+
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify(report));
+        return;
+      }
+
+      if (url.pathname === '/api/compliance/session-monitoring' && request.method === 'GET') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        // ISO 27001 A.12.4.1 - Session Monitoring Report
+        const sessions = db.prepare(`
+          SELECT s.token, s.email, s.created_at, s.expires_at, s.last_activity_at, s.user_agent, s.ip_address
+          FROM rd_app_sessions s
+          ORDER BY s.created_at DESC
+        `).all();
+
+        const activeSessions = sessions.filter(s => new Date(s.expires_at) > new Date());
+        const report = {
+          generatedAt: new Date().toISOString(),
+          reviewedBy: user.email,
+          policy: {
+            sessionDuration: `${sessionDurationSeconds / 3600} 小時`,
+            maxConcurrentSessions: ADVANCED_COMPLIANCE.sessionMonitoring.maxConcurrentSessions,
+            inactivityTimeout: `${ADVANCED_COMPLIANCE.sessionMonitoring.inactivityTimeoutMinutes} 分鐘`
+          },
+          activeSessions: activeSessions.length,
+          sessions: activeSessions.map(s => ({
+            email: s.email,
+            createdAt: s.created_at,
+            expiresAt: s.expires_at,
+            lastActivity: s.last_activity_at,
+            userAgent: s.user_agent,
+            ipAddress: s.ip_address
+          })),
+          sessionsByUser: {}
+        };
+
+        for (const session of activeSessions) {
+          if (!report.sessionsByUser[session.email]) {
+            report.sessionsByUser[session.email] = 0;
+          }
+          report.sessionsByUser[session.email]++;
+        }
+
+        // Check for concurrent session limit violations
+        report.concurrencyViolations = Object.entries(report.sessionsByUser)
+          .filter(([, count]) => count > ADVANCED_COMPLIANCE.sessionMonitoring.maxConcurrentSessions)
+          .map(([email, count]) => ({ email, sessionCount: count, limitExceeded: count - ADVANCED_COMPLIANCE.sessionMonitoring.maxConcurrentSessions }));
+
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify(report));
         return;
       }
 

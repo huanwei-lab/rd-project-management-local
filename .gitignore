@@ -6,4 +6,5 @@ node_modules/
 *.log
 coverage/
 db/*.sqlite
+db/backups/
 server/.tmp/

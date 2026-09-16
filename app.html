@@ -173,6 +173,12 @@ authButton.className='btn';
 authButton.id='authButton';
 authButton.textContent='登入';
 $('.actions').prepend(authButton);
+const adminButton=document.createElement('button');
+adminButton.className='btn';
+adminButton.id='adminButton';
+adminButton.textContent='帳號管理';
+adminButton.style.display='none';
+$('.actions').prepend(adminButton);
 function setSync(state,label){
   $('#syncDot').className='sync-dot '+state;
   $('#syncState').textContent=label;
@@ -181,10 +187,16 @@ function setAuthLabel(){
   authButton.textContent=sharedSession?'登出':'登入';
 }
 async function fetchUsers(){
-  const response=await fetch('/api/users',{headers:{accept:'application/json'}});
+  const response=await fetch('/api/login/options',{headers:{accept:'application/json'}});
   const data=await response.json();
   if(!response.ok||!Array.isArray(data.users)||!data.users.length)throw new Error('無可用登入帳號');
   return data.users;
+}
+async function apiJson(url,options={}){
+  const response=await fetch(url,options);
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(data.error||'操作失敗');
+  return data;
 }
 async function loginPrompt(){
   const users=await fetchUsers();
@@ -243,6 +255,7 @@ function applySharedPermissions(){
     $('#newTask').style.display='none';
     $('#exportBackup').style.display='none';
     $('#importBackup').style.display='none';
+    adminButton.style.display='none';
     return;
   }
   const manage=canManageCurrent();
@@ -250,6 +263,65 @@ function applySharedPermissions(){
   $('#newTask').style.display=manage?'inline-block':'none';
   $('#exportBackup').style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
   $('#importBackup').style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
+  adminButton.style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
+}
+function formatUsers(users){
+  return users.map((u,i)=>`${i+1}. ${u.displayName} <${u.email}> [${u.accessRole}]`).join('\n');
+}
+async function listUsers(){
+  const data=await apiJson('/api/users',{headers:{accept:'application/json'}});
+  return data.users||[];
+}
+async function manageAccounts(){
+  if(!sharedSession||sharedSession.accessRole!=='admin'){
+    alert('只有管理者可以使用帳號管理');
+    return;
+  }
+
+  const users=await listUsers();
+  const action=(prompt(`帳號管理\n${formatUsers(users)}\n\n輸入 add / edit / delete / audit`,'add')||'').trim().toLowerCase();
+  if(!action)return;
+
+  if(action==='add'){
+    const email=(prompt('新帳號 Email')||'').trim().toLowerCase();
+    const displayName=(prompt('顯示名稱')||'').trim();
+    const accessRole=(prompt('角色：admin/pm/pe/ce/me/sme/qe/viewer','viewer')||'').trim().toLowerCase();
+    if(!email||!displayName||!accessRole)return;
+    await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole})});
+    alert('帳號已新增');
+    return;
+  }
+
+  if(action==='edit'){
+    const target=(prompt('要修改的帳號 Email')||'').trim().toLowerCase();
+    if(!target)return;
+    const current=users.find(u=>u.email===target);
+    if(!current)throw new Error('找不到此帳號');
+    const displayName=(prompt('新的顯示名稱',current.displayName)||'').trim();
+    const accessRole=(prompt('新的角色：admin/pm/pe/ce/me/sme/qe/viewer',current.accessRole)||'').trim().toLowerCase();
+    await apiJson(`/api/users/${encodeURIComponent(target)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({displayName,accessRole})});
+    alert('帳號已更新');
+    return;
+  }
+
+  if(action==='delete'){
+    const target=(prompt('要刪除的帳號 Email')||'').trim().toLowerCase();
+    if(!target)return;
+    const ok=confirm(`確定刪除 ${target} 嗎？`);
+    if(!ok)return;
+    await apiJson(`/api/users/${encodeURIComponent(target)}`,{method:'DELETE'});
+    alert('帳號已刪除');
+    return;
+  }
+
+  if(action==='audit'){
+    const data=await apiJson('/api/audit?limit=30',{headers:{accept:'application/json'}});
+    const lines=(data.logs||[]).map(x=>`#${x.id} ${x.createdAt} ${x.email} ${x.action}`).join('\n');
+    alert(lines||'目前沒有稽核紀錄');
+    return;
+  }
+
+  alert('未識別的指令，請輸入 add / edit / delete / audit');
 }
 authButton.onclick=async()=>{
   try{
@@ -267,6 +339,13 @@ authButton.onclick=async()=>{
     render();
   }catch(error){
     alert(error.message||'登入流程失敗');
+  }
+};
+adminButton.onclick=async()=>{
+  try{
+    await manageAccounts();
+  }catch(error){
+    alert(error.message||'帳號管理失敗');
   }
 };
 const renderBeforeShared=render;

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -18,6 +19,8 @@ const corsHeaders = {
 };
 
 const sessionCookieName = 'rd_local_session';
+const sessionDurationSeconds = 60 * 60 * 8;
+const allowedRoles = new Set(['admin', 'pm', 'pe', 'ce', 'me', 'sme', 'qe', 'viewer']);
 
 function addCorsHeaders(headers = {}) {
   return { ...corsHeaders, ...headers };
@@ -69,6 +72,13 @@ function initializeDatabase(db) {
       action TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS rd_app_sessions (
+      token TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
   `);
 
   const adminEmail = process.env.LOCAL_ADMIN_EMAIL || 'local-admin@localhost';
@@ -78,6 +88,29 @@ function initializeDatabase(db) {
   db.prepare(
     'INSERT OR IGNORE INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)'
   ).run(adminEmail, adminDisplayName, adminRole, now);
+
+  const extraUsersJson = process.env.LOCAL_USERS_JSON;
+  if (extraUsersJson) {
+    try {
+      const extraUsers = JSON.parse(extraUsersJson);
+      if (Array.isArray(extraUsers)) {
+        const insertUser = db.prepare(
+          'INSERT OR IGNORE INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)'
+        );
+        for (const user of extraUsers) {
+          const email = user?.email?.trim()?.toLowerCase();
+          const displayName = user?.displayName?.trim();
+          const accessRole = user?.accessRole?.trim()?.toLowerCase();
+          if (!email || !displayName || !allowedRoles.has(accessRole)) {
+            continue;
+          }
+          insertUser.run(email, displayName, accessRole, now);
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to parse LOCAL_USERS_JSON:', error.message);
+    }
+  }
 }
 
 function getDefaultAdminUser() {
@@ -127,19 +160,161 @@ function getUserByEmail(db, email) {
 
 function getSessionUser(request, db) {
   const cookies = parseCookies(request);
-  const sessionEmail = cookies[sessionCookieName];
-  if (!sessionEmail) {
+  const sessionToken = cookies[sessionCookieName];
+  if (!sessionToken) {
     return null;
   }
-  return getUserByEmail(db, sessionEmail);
+
+  const now = new Date().toISOString();
+  const row = db.prepare(
+    `SELECT u.email, u.display_name, u.access_role, s.expires_at
+     FROM rd_app_sessions s
+     JOIN rd_app_users u ON u.email = s.email
+     WHERE s.token = ?`
+  ).get(sessionToken);
+
+  if (!row) {
+    return null;
+  }
+
+  if (row.expires_at <= now) {
+    db.prepare('DELETE FROM rd_app_sessions WHERE token = ?').run(sessionToken);
+    return null;
+  }
+
+  return {
+    email: row.email,
+    displayName: row.display_name,
+    accessRole: row.access_role,
+    sessionToken
+  };
 }
 
-function makeSessionCookie(email) {
-  return `${sessionCookieName}=${encodeURIComponent(email)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`;
+function makeSessionCookie(token) {
+  return `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${sessionDurationSeconds}`;
 }
 
 function clearSessionCookie() {
   return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
+function createSession(db, email) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const createdAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + sessionDurationSeconds * 1000).toISOString();
+  db.prepare('INSERT INTO rd_app_sessions (token, email, created_at, expires_at) VALUES (?, ?, ?, ?)').run(token, email, createdAt, expiresAt);
+  return token;
+}
+
+function appendAudit(db, email, action) {
+  db.prepare('INSERT INTO rd_audit_log (email, action, created_at) VALUES (?, ?, ?)').run(email || 'anonymous', action, new Date().toISOString());
+}
+
+function safeParseInt(value, fallback) {
+  const number = Number.parseInt(value, 10);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function validateUserPayload(payload, { partial = false } = {}) {
+  const email = payload?.email?.trim()?.toLowerCase();
+  const displayName = payload?.displayName?.trim();
+  const accessRole = payload?.accessRole?.trim()?.toLowerCase();
+
+  if (!partial || payload?.email !== undefined) {
+    if (!email || !email.includes('@')) {
+      return { error: 'Email 格式無效' };
+    }
+  }
+
+  if (!partial || payload?.displayName !== undefined) {
+    if (!displayName) {
+      return { error: '顯示名稱不可空白' };
+    }
+  }
+
+  if (!partial || payload?.accessRole !== undefined) {
+    if (!accessRole || !allowedRoles.has(accessRole)) {
+      return { error: '角色無效' };
+    }
+  }
+
+  return { email, displayName, accessRole };
+}
+
+function canManageProject(project, userDisplayName) {
+  return project?.members?.PM === userDisplayName || project?.members?.PE === userDisplayName;
+}
+
+function canWriteState(user, currentState, nextState) {
+  if (user?.accessRole === 'admin') {
+    return true;
+  }
+
+  if (!currentState || !Array.isArray(currentState.projects)) {
+    return false;
+  }
+
+  const currentProjects = new Map(currentState.projects.map((project) => [project.id, project]));
+  const nextProjects = Array.isArray(nextState.projects) ? nextState.projects : [];
+
+  if (currentProjects.size !== nextProjects.length) {
+    return false;
+  }
+
+  for (const nextProject of nextProjects) {
+    const currentProject = currentProjects.get(nextProject.id);
+    if (!currentProject) {
+      return false;
+    }
+
+    if (
+      nextProject.name !== currentProject.name ||
+      (nextProject.description || '') !== (currentProject.description || '') ||
+      (nextProject.group || '') !== (currentProject.group || '') ||
+      (nextProject.difficulty || '') !== (currentProject.difficulty || '') ||
+      JSON.stringify(nextProject.members || {}) !== JSON.stringify(currentProject.members || {})
+    ) {
+      return false;
+    }
+
+    const nextTasks = Array.isArray(nextProject.tasks) ? nextProject.tasks : [];
+    const currentTasks = Array.isArray(currentProject.tasks) ? currentProject.tasks : [];
+    if (nextTasks.length !== currentTasks.length) {
+      return false;
+    }
+
+    const managed = canManageProject(currentProject, user.displayName);
+    if (managed) {
+      continue;
+    }
+
+    const ownRoles = new Set(
+      Object.entries(currentProject.members || {})
+        .filter(([, person]) => person === user.displayName)
+        .map(([role]) => role)
+    );
+
+    const currentTaskMap = new Map(currentTasks.map((task) => [task.id, task]));
+    for (const nextTask of nextTasks) {
+      const currentTask = currentTaskMap.get(nextTask.id);
+      if (!currentTask) {
+        return false;
+      }
+
+      const ownTask = ownRoles.has(currentTask.role);
+      if (!ownTask && JSON.stringify(nextTask) !== JSON.stringify(currentTask)) {
+        return false;
+      }
+
+      if (ownTask) {
+        if (nextTask.role !== currentTask.role || nextTask.name !== currentTask.name) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
 }
 
 function parseJsonBody(request) {
@@ -172,13 +347,186 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       const url = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
       const user = getSessionUser(request, db);
 
-      if (url.pathname === '/api/users' && request.method === 'GET') {
+      if (url.pathname === '/api/login/options' && request.method === 'GET') {
         const users = db.prepare('SELECT email, display_name AS displayName, access_role AS accessRole FROM rd_app_users ORDER BY created_at ASC, email ASC').all();
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store'
         }));
         response.end(JSON.stringify({ users }));
+        return;
+      }
+
+      if (url.pathname === '/api/users' && request.method === 'GET') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        const users = db.prepare('SELECT email, display_name AS displayName, access_role AS accessRole, created_at AS createdAt FROM rd_app_users ORDER BY created_at ASC, email ASC').all();
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify({ users }));
+        return;
+      }
+
+      if (url.pathname === '/api/users' && request.method === 'POST') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        const payload = await parseJsonBody(request);
+        const validated = validateUserPayload(payload);
+        if (validated.error) {
+          response.writeHead(400, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: validated.error }));
+          return;
+        }
+
+        const existing = getUserByEmail(db, validated.email);
+        if (existing) {
+          response.writeHead(409, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '帳號已存在' }));
+          return;
+        }
+
+        db.prepare('INSERT INTO rd_app_users (email, display_name, access_role, created_at) VALUES (?, ?, ?, ?)').run(
+          validated.email,
+          validated.displayName,
+          validated.accessRole,
+          new Date().toISOString()
+        );
+        appendAudit(db, user.email, `create_user:${validated.email}`);
+        response.writeHead(201, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/users/') && request.method === 'PATCH') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        const targetEmail = decodeURIComponent(url.pathname.slice('/api/users/'.length)).trim().toLowerCase();
+        const payload = await parseJsonBody(request);
+        const validated = validateUserPayload(payload, { partial: true });
+        if (validated.error) {
+          response.writeHead(400, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: validated.error }));
+          return;
+        }
+
+        const existing = getUserByEmail(db, targetEmail);
+        if (!existing) {
+          response.writeHead(404, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '找不到此帳號' }));
+          return;
+        }
+
+        const nextRole = validated.accessRole || existing.accessRole;
+        if (existing.accessRole === 'admin' && nextRole !== 'admin') {
+          const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users WHERE access_role='admin'").get().n;
+          if (adminCount <= 1) {
+            response.writeHead(400, addCorsHeaders({
+              'content-type': 'application/json; charset=utf-8'
+            }));
+            response.end(JSON.stringify({ error: '至少要保留一位管理者' }));
+            return;
+          }
+        }
+
+        db.prepare('UPDATE rd_app_users SET display_name=?, access_role=? WHERE email=?').run(
+          validated.displayName || existing.displayName,
+          nextRole,
+          targetEmail
+        );
+        appendAudit(db, user.email, `update_user:${targetEmail}`);
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (url.pathname.startsWith('/api/users/') && request.method === 'DELETE') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        const targetEmail = decodeURIComponent(url.pathname.slice('/api/users/'.length)).trim().toLowerCase();
+        const existing = getUserByEmail(db, targetEmail);
+        if (!existing) {
+          response.writeHead(404, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '找不到此帳號' }));
+          return;
+        }
+
+        if (existing.accessRole === 'admin') {
+          const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users WHERE access_role='admin'").get().n;
+          if (adminCount <= 1) {
+            response.writeHead(400, addCorsHeaders({
+              'content-type': 'application/json; charset=utf-8'
+            }));
+            response.end(JSON.stringify({ error: '至少要保留一位管理者' }));
+            return;
+          }
+        }
+
+        db.prepare('DELETE FROM rd_app_users WHERE email=?').run(targetEmail);
+        db.prepare('DELETE FROM rd_app_sessions WHERE email=?').run(targetEmail);
+        appendAudit(db, user.email, `delete_user:${targetEmail}`);
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8'
+        }));
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (url.pathname === '/api/audit' && request.method === 'GET') {
+        if (!user || user.accessRole !== 'admin') {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        const limit = Math.min(Math.max(safeParseInt(url.searchParams.get('limit'), 50), 1), 500);
+        const rows = db.prepare('SELECT id, email, action, created_at AS createdAt FROM rd_audit_log ORDER BY id DESC LIMIT ?').all(limit);
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify({ logs: rows }));
         return;
       }
 
@@ -194,16 +542,22 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
+        const token = createSession(db, nextUser.email);
+        appendAudit(db, nextUser.email, 'login');
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
-          'set-cookie': makeSessionCookie(nextUser.email)
+          'set-cookie': makeSessionCookie(token)
         }));
         response.end(JSON.stringify({ user: nextUser }));
         return;
       }
 
       if (url.pathname === '/api/logout' && request.method === 'POST') {
+        if (user?.sessionToken) {
+          db.prepare('DELETE FROM rd_app_sessions WHERE token=?').run(user.sessionToken);
+          appendAudit(db, user.email, 'logout');
+        }
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
@@ -267,6 +621,16 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
               'content-type': 'application/json; charset=utf-8'
             }));
             response.end(JSON.stringify({ error: '專案資料格式錯誤' }));
+            return;
+          }
+
+          const currentRow = db.prepare("SELECT json FROM rd_app_state WHERE key='main'").get();
+          const currentState = currentRow ? JSON.parse(currentRow.json) : null;
+          if (!canWriteState(user, currentState, next)) {
+            response.writeHead(403, addCorsHeaders({
+              'content-type': 'application/json; charset=utf-8'
+            }));
+            response.end(JSON.stringify({ error: '你沒有權限變更這些內容' }));
             return;
           }
 

@@ -52,6 +52,9 @@ LOCAL_ADMIN_ROLE=admin
 - 由本地 SQLite 持久化，不依賴雲端服務
 - 提供 `/api/session` 與 `/api/state`，支援前端共用資料同步
 - 提供本地登入 / 登出（Cookie Session）
+- 後端權限控管（管理者/專案 PM-PE/任務負責人）
+- 帳號管理（管理者可新增/修改/刪除帳號）
+- 稽核紀錄（登入、登出、資料更新、帳號異動）
 - 支援匯出 / 匯入備份 JSON
 - 可直接在 LAN 中由多台電腦使用
 
@@ -75,6 +78,25 @@ npm run build
 npm run validate
 npm test
 npm run test:lan
+npm run backup:db
+```
+
+## 帳號管理
+
+- 管理者登入後，右上角可見 `帳號管理`
+- 可執行 `add / edit / delete / audit`
+- 角色可用值：`admin`, `pm`, `pe`, `ce`, `me`, `sme`, `qe`, `viewer`
+
+## 自動資料庫備份
+
+- 執行 `npm run backup:db` 會複製 SQLite 到 `db/backups/`
+- 預設保留最近 20 份，可用 `BACKUP_KEEP` 調整
+- 可用 `BACKUP_DIR` 指定備份資料夾
+
+範例：
+
+```bash
+BACKUP_KEEP=30 BACKUP_DIR=./backup-storage npm run backup:db
 ```
 
 ## 本地部署建議

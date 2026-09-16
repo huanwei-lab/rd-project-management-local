@@ -302,61 +302,158 @@ function applySharedPermissions(){
   $('#importBackup').style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
   adminButton.style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
 }
-function formatUsers(users){
-  return users.map((u,i)=>`${i+1}. ${u.displayName} <${u.email}> [${u.accessRole}]`).join('\n');
-}
 async function listUsers(){
   const data=await apiJson('/api/users',{headers:{accept:'application/json'}});
   return data.users||[];
 }
+
+function ensureAccountModal(){
+  let modal=document.querySelector('#accountAdminModal');
+  if(modal)return modal;
+  modal=document.createElement('div');
+  modal.id='accountAdminModal';
+  modal.className='modal-bg';
+  modal.innerHTML='\
+  <div class="modal" style="max-width:920px;width:min(96vw,920px)">\
+    <h2>帳號管理</h2>\
+    <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:14px;align-items:start">\
+      <div style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff">\
+        <div style="display:grid;grid-template-columns:1.1fr 1.2fr .7fr;background:#f7f8fb;padding:9px 10px;font-size:.75rem;color:var(--muted)">\
+          <span>姓名</span><span>Email</span><span>角色</span>\
+        </div>\
+        <div id="accountRows" style="max-height:280px;overflow:auto"></div>\
+      </div>\
+      <div>\
+        <div class="field"><label>顯示名稱</label><input id="accountNameInput" placeholder="例如：王小明"></div>\
+        <div class="field"><label>Email</label><input id="accountEmailInput" placeholder="name@company.com"></div>\
+        <div class="field"><label>角色</label><select id="accountRoleInput"><option>admin</option><option>pm</option><option>pe</option><option>ce</option><option>me</option><option>sme</option><option>qe</option><option selected>viewer</option></select></div>\
+        <div class="modal-actions" style="margin-top:6px">\
+          <button type="button" class="btn" id="accountNewBtn">新增模式</button>\
+          <button type="button" class="btn primary" id="accountSaveBtn">儲存</button>\
+          <button type="button" class="btn danger" id="accountDeleteBtn">刪除</button>\
+        </div>\
+      </div>\
+    </div>\
+    <div style="margin-top:12px;border:1px solid var(--line);border-radius:10px;padding:10px;background:#fff">\
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">\
+        <b style="font-size:.85rem">最近稽核紀錄</b>\
+        <button type="button" class="btn" id="accountAuditBtn">重新讀取稽核</button>\
+      </div>\
+      <pre id="accountAuditBox" style="white-space:pre-wrap;font-size:.73rem;line-height:1.45;color:#3f4860;max-height:150px;overflow:auto;margin:8px 0 0"></pre>\
+    </div>\
+    <div class="modal-actions">\
+      <button type="button" class="btn" id="accountCloseBtn">關閉</button>\
+    </div>\
+  </div>';
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function accountState(){
+  if(!window.__accountAdminState)window.__accountAdminState={users:[],selectedEmail:''};
+  return window.__accountAdminState;
+}
+
+function renderAccountRows(){
+  const state=accountState();
+  const rows=$('#accountRows');
+  rows.innerHTML=state.users.map((user)=>`<button type="button" data-account-email="${esc(user.email)}" style="display:grid;grid-template-columns:1.1fr 1.2fr .7fr;width:100%;text-align:left;border:0;border-top:1px solid #eef0f4;background:${state.selectedEmail===user.email?'#f0f4ff':'#fff'};padding:9px 10px;font:inherit;cursor:pointer"><span>${esc(user.displayName)}</span><span>${esc(user.email)}</span><span>${esc(user.accessRole)}</span></button>`).join('')||'<div style="padding:14px;color:var(--muted)">目前沒有帳號</div>';
+}
+
+function fillAccountForm(user){
+  $('#accountNameInput').value=user?.displayName||'';
+  $('#accountEmailInput').value=user?.email||'';
+  $('#accountEmailInput').readOnly=Boolean(user?.email);
+  $('#accountRoleInput').value=user?.accessRole||'viewer';
+}
+
+async function refreshAudit(){
+  const data=await apiJson('/api/audit?limit=30',{headers:{accept:'application/json'}});
+  const lines=(data.logs||[]).map((log)=>`${log.createdAt}  ${log.email}  ${log.action}`);
+  $('#accountAuditBox').textContent=lines.join('\n')||'目前沒有稽核紀錄';
+}
+
+async function refreshUsersAndRender(){
+  const state=accountState();
+  state.users=await listUsers();
+  if(!state.users.some((user)=>user.email===state.selectedEmail)){
+    state.selectedEmail='';
+  }
+  renderAccountRows();
+  if(state.selectedEmail){
+    fillAccountForm(state.users.find((user)=>user.email===state.selectedEmail));
+  }
+}
+
+function bindAccountModalEvents(){
+  const state=accountState();
+  $('#accountRows').onclick=(event)=>{
+    const button=event.target.closest('[data-account-email]');
+    if(!button)return;
+    state.selectedEmail=button.dataset.accountEmail;
+    renderAccountRows();
+    fillAccountForm(state.users.find((user)=>user.email===state.selectedEmail));
+  };
+
+  $('#accountNewBtn').onclick=()=>{
+    state.selectedEmail='';
+    fillAccountForm(null);
+    renderAccountRows();
+  };
+
+  $('#accountSaveBtn').onclick=async()=>{
+    const email=$('#accountEmailInput').value.trim().toLowerCase();
+    const displayName=$('#accountNameInput').value.trim();
+    const accessRole=$('#accountRoleInput').value;
+    if(!email||!displayName){
+      toast('請填寫姓名與 Email');
+      return;
+    }
+
+    if(state.selectedEmail){
+      await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({displayName,accessRole})});
+      toast('帳號已更新');
+    }else{
+      await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole})});
+      state.selectedEmail=email;
+      toast('帳號已新增');
+    }
+
+    await refreshUsersAndRender();
+    await refreshAudit();
+  };
+
+  $('#accountDeleteBtn').onclick=async()=>{
+    if(!state.selectedEmail){
+      toast('請先選擇要刪除的帳號');
+      return;
+    }
+    await apiJson(`/api/users/${encodeURIComponent(state.selectedEmail)}`,{method:'DELETE'});
+    toast('帳號已刪除');
+    state.selectedEmail='';
+    fillAccountForm(null);
+    await refreshUsersAndRender();
+    await refreshAudit();
+  };
+
+  $('#accountAuditBtn').onclick=refreshAudit;
+  $('#accountCloseBtn').onclick=closeAll;
+}
+
 async function manageAccounts(){
   if(!sharedSession||sharedSession.accessRole!=='admin'){
     toast('只有管理者可以使用帳號管理');
     return;
   }
-
-  const users=await listUsers();
-  const action=(await promptInput(`帳號管理\n${formatUsers(users)}\n\n輸入 add / edit / delete / audit`,'add')).trim().toLowerCase();
-  if(!action)return;
-
-  if(action==='add'){
-    const email=(await promptInput('新帳號 Email')).trim().toLowerCase();
-    const displayName=(await promptInput('顯示名稱')).trim();
-    const accessRole=(await promptInput('角色：admin/pm/pe/ce/me/sme/qe/viewer','viewer')).trim().toLowerCase();
-    if(!email||!displayName||!accessRole)return;
-    await apiJson('/api/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,displayName,accessRole})});
-    toast('帳號已新增');
-    return;
+  const modal=ensureAccountModal();
+  if(!modal.dataset.bound){
+    bindAccountModalEvents();
+    modal.dataset.bound='1';
   }
-
-  if(action==='edit'){
-    const target=(await promptInput('要修改的帳號 Email')).trim().toLowerCase();
-    if(!target)return;
-    const current=users.find(u=>u.email===target);
-    if(!current)throw new Error('找不到此帳號');
-    const displayName=(await promptInput('新的顯示名稱',current.displayName)).trim();
-    const accessRole=(await promptInput('新的角色：admin/pm/pe/ce/me/sme/qe/viewer',current.accessRole)).trim().toLowerCase();
-    await apiJson(`/api/users/${encodeURIComponent(target)}`,{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({displayName,accessRole})});
-    toast('帳號已更新');
-    return;
-  }
-
-  if(action==='delete'){
-    const target=(await promptInput('要刪除的帳號 Email')).trim().toLowerCase();
-    if(!target)return;
-    await apiJson(`/api/users/${encodeURIComponent(target)}`,{method:'DELETE'});
-    toast('帳號已刪除');
-    return;
-  }
-
-  if(action==='audit'){
-    const data=await apiJson('/api/audit?limit=30',{headers:{accept:'application/json'}});
-    const lines=(data.logs||[]).slice(0,5).map(x=>`#${x.id} ${x.email} ${x.action}`).join(' | ');
-    toast(lines||'目前沒有稽核紀錄');
-    return;
-  }
-
-  toast('未識別指令，請輸入 add / edit / delete / audit');
+  await refreshUsersAndRender();
+  fillAccountForm(null);
+  await refreshAudit();
+  show('#accountAdminModal');
 }
 authButton.onclick=async()=>{
   try{

@@ -11,11 +11,13 @@ const defaultDbPath = path.join(rootDir, 'db', 'local-projects.sqlite');
 const defaultHtmlPath = path.join(rootDir, 'app.html');
 const corsHeaders = {
   'access-control-allow-origin': process.env.ALLOWED_ORIGINS || '*',
-  'access-control-allow-methods': 'GET, PUT, OPTIONS',
+  'access-control-allow-methods': 'GET, PUT, POST, OPTIONS',
   'access-control-allow-headers': 'Content-Type, Authorization, X-Requested-With',
   'access-control-max-age': '86400',
   vary: 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
 };
+
+const sessionCookieName = 'rd_local_session';
 
 function addCorsHeaders(headers = {}) {
   return { ...corsHeaders, ...headers };
@@ -78,12 +80,66 @@ function initializeDatabase(db) {
   ).run(adminEmail, adminDisplayName, adminRole, now);
 }
 
-function getLocalUser() {
+function getDefaultAdminUser() {
   return {
     email: process.env.LOCAL_ADMIN_EMAIL || 'local-admin@localhost',
     displayName: process.env.LOCAL_ADMIN_NAME || 'Local Admin',
     accessRole: process.env.LOCAL_ADMIN_ROLE || 'admin'
   };
+}
+
+function parseCookies(request) {
+  const cookieHeader = request.headers.cookie || '';
+  return cookieHeader
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((acc, pair) => {
+      const index = pair.indexOf('=');
+      if (index <= 0) {
+        return acc;
+      }
+      const key = pair.slice(0, index).trim();
+      const value = pair.slice(index + 1).trim();
+      acc[key] = decodeURIComponent(value);
+      return acc;
+    }, {});
+}
+
+function toSessionUser(row) {
+  if (!row) {
+    return null;
+  }
+  return {
+    email: row.email,
+    displayName: row.display_name,
+    accessRole: row.access_role
+  };
+}
+
+function getUserByEmail(db, email) {
+  if (!email) {
+    return null;
+  }
+  const row = db.prepare('SELECT email, display_name, access_role FROM rd_app_users WHERE email=?').get(email);
+  return toSessionUser(row);
+}
+
+function getSessionUser(request, db) {
+  const cookies = parseCookies(request);
+  const sessionEmail = cookies[sessionCookieName];
+  if (!sessionEmail) {
+    return null;
+  }
+  return getUserByEmail(db, sessionEmail);
+}
+
+function makeSessionCookie(email) {
+  return `${sessionCookieName}=${encodeURIComponent(email)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`;
+}
+
+function clearSessionCookie() {
+  return `${sessionCookieName}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 }
 
 function parseJsonBody(request) {
@@ -114,7 +170,48 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
   const server = http.createServer(async (request, response) => {
     try {
       const url = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
-      const user = getLocalUser();
+      const user = getSessionUser(request, db);
+
+      if (url.pathname === '/api/users' && request.method === 'GET') {
+        const users = db.prepare('SELECT email, display_name AS displayName, access_role AS accessRole FROM rd_app_users ORDER BY created_at ASC, email ASC').all();
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify({ users }));
+        return;
+      }
+
+      if (url.pathname === '/api/login' && request.method === 'POST') {
+        const payload = await parseJsonBody(request);
+        const email = payload?.email?.trim()?.toLowerCase();
+        const nextUser = getUserByEmail(db, email);
+        if (!nextUser) {
+          response.writeHead(401, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '找不到此帳號' }));
+          return;
+        }
+
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'set-cookie': makeSessionCookie(nextUser.email)
+        }));
+        response.end(JSON.stringify({ user: nextUser }));
+        return;
+      }
+
+      if (url.pathname === '/api/logout' && request.method === 'POST') {
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+          'set-cookie': clearSessionCookie()
+        }));
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
 
       if (request.method === 'OPTIONS') {
         response.writeHead(204, addCorsHeaders({
@@ -125,6 +222,15 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/session') {
+        if (!user) {
+          response.writeHead(401, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store'
+          }));
+          response.end(JSON.stringify({ loggedIn: false, error: '尚未登入' }));
+          return;
+        }
+
         response.writeHead(200, addCorsHeaders({
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store'
@@ -134,6 +240,15 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/state') {
+        if (!user) {
+          response.writeHead(401, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store'
+          }));
+          response.end(JSON.stringify({ error: '尚未登入' }));
+          return;
+        }
+
         if (request.method === 'GET') {
           const row = db.prepare("SELECT json, updated_at AS updatedAt, updated_by AS updatedBy FROM rd_app_state WHERE key='main'").get();
           const payload = row ? { state: JSON.parse(row.json), updatedAt: row.updatedAt, updatedBy: row.updatedBy } : { empty: true, user };
@@ -230,8 +345,11 @@ if (isDirectExecution) {
   const host = process.env.HOST || '0.0.0.0';
   const dbPath = process.env.DB_PATH || defaultDbPath;
 
+  const defaultAdmin = getDefaultAdminUser();
+
   const { server } = await createServer({ host, port, dbPath });
   const address = server.address();
   console.log(`Local project management server running at http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${address.port}`);
   console.log(`Shared database: ${dbPath}`);
+  console.log(`Default login email: ${defaultAdmin.email}`);
 }

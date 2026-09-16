@@ -168,9 +168,46 @@ const syncUser=document.createElement('div');
 syncUser.className='sync-user';
 syncUser.innerHTML='<span class="sync-dot" id="syncDot"></span><div><b id="syncName">正在連線</b><small id="syncState">共用資料庫</small></div>';
 $('.actions').appendChild(syncUser);
+const authButton=document.createElement('button');
+authButton.className='btn';
+authButton.id='authButton';
+authButton.textContent='登入';
+$('.actions').prepend(authButton);
 function setSync(state,label){
   $('#syncDot').className='sync-dot '+state;
   $('#syncState').textContent=label;
+}
+function setAuthLabel(){
+  authButton.textContent=sharedSession?'登出':'登入';
+}
+async function fetchUsers(){
+  const response=await fetch('/api/users',{headers:{accept:'application/json'}});
+  const data=await response.json();
+  if(!response.ok||!Array.isArray(data.users)||!data.users.length)throw new Error('無可用登入帳號');
+  return data.users;
+}
+async function loginPrompt(){
+  const users=await fetchUsers();
+  const defaultEmail=users[0].email;
+  const choices=users.map(u=>`${u.displayName} <${u.email}> (${u.accessRole})`).join('\n');
+  const email=(prompt(`請輸入登入 Email：\n${choices}`,defaultEmail)||'').trim().toLowerCase();
+  if(!email)return false;
+  const response=await fetch('/api/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})});
+  const data=await response.json();
+  if(!response.ok)throw new Error(data.error||'登入失敗');
+  sharedSession=data.user;
+  $('#syncName').textContent=sharedSession.displayName;
+  $('.avatar').textContent=initials(sharedSession.displayName);
+  setAuthLabel();
+  return true;
+}
+async function logoutSession(){
+  await fetch('/api/logout',{method:'POST'});
+  sharedSession=null;
+  sharedLoading=true;
+  setAuthLabel();
+  $('#syncName').textContent='尚未登入';
+  setSync('error','請先登入');
 }
 function sharedPayload(){return {projects,activeProjectId:activeId,updatedAt:new Date().toISOString()}}
 async function fetchShared(){
@@ -201,13 +238,37 @@ function canManageCurrent(){
   return sharedSession?.accessRole==='admin'||current()?.members?.PM===sharedSession?.displayName||current()?.members?.PE===sharedSession?.displayName;
 }
 function applySharedPermissions(){
-  if(!sharedSession)return;
+  if(!sharedSession){
+    $('#editProject').style.display='none';
+    $('#newTask').style.display='none';
+    $('#exportBackup').style.display='none';
+    $('#importBackup').style.display='none';
+    return;
+  }
   const manage=canManageCurrent();
   $('#editProject').style.display=manage?'inline-block':'none';
   $('#newTask').style.display=manage?'inline-block':'none';
   $('#exportBackup').style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
   $('#importBackup').style.display=sharedSession.accessRole==='admin'?'inline-block':'none';
 }
+authButton.onclick=async()=>{
+  try{
+    if(sharedSession){
+      const shouldLogout=confirm('確定要登出目前帳號嗎？');
+      if(!shouldLogout)return;
+      await logoutSession();
+      render();
+      return;
+    }
+    const loggedIn=await loginPrompt();
+    if(!loggedIn)return;
+    sharedLoading=false;
+    setSync('ready','已同步');
+    render();
+  }catch(error){
+    alert(error.message||'登入流程失敗');
+  }
+};
 const renderBeforeShared=render;
 render=function(){renderBeforeShared();applySharedPermissions()};
 document.addEventListener('click',e=>{
@@ -220,11 +281,18 @@ document.addEventListener('click',e=>{
 },true);
 (async()=>{
   try{
-    const sessionResponse=await fetch('/api/session'),sessionData=await sessionResponse.json();
+    setAuthLabel();
+    let sessionResponse=await fetch('/api/session');
+    if(sessionResponse.status===401){
+      await loginPrompt();
+      sessionResponse=await fetch('/api/session');
+    }
+    const sessionData=await sessionResponse.json();
     if(!sessionResponse.ok)throw new Error(sessionData.error||'帳號沒有使用權限');
     sharedSession=sessionData.user;
     $('#syncName').textContent=sharedSession.displayName;
     $('.avatar').textContent=initials(sharedSession.displayName);
+    setAuthLabel();
     const remote=await fetchShared();
     if(remote.empty){
       if(sharedSession.accessRole!=='admin')throw new Error('請由管理者先建立共用資料');

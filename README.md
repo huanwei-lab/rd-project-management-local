@@ -51,8 +51,21 @@ LOCAL_ADMIN_ROLE=admin
 - 單一資料來源，所有電腦共用同一份專案資料
 - 由本地 SQLite 持久化，不依賴雲端服務
 - 提供 `/api/session` 與 `/api/state`，支援前端共用資料同步
+- 提供本地登入 / 登出（Cookie Session）
 - 支援匯出 / 匯入備份 JSON
 - 可直接在 LAN 中由多台電腦使用
+
+## 登入與登出
+
+- 首次開啟網頁時，若尚未登入，會要求輸入 Email 進行登入
+- 右上角有 `登入 / 登出` 按鈕可切換帳號
+- 預設管理者帳號來自環境變數 `LOCAL_ADMIN_EMAIL`（未設定時為 `local-admin@localhost`）
+
+## 為什麼看不到之前資料
+
+- 現在資料來源是伺服器端 `db/local-projects.sqlite`，不是瀏覽器本機 localStorage
+- 若你換了伺服器電腦、換了 `DB_PATH`，或資料庫檔案是新的，就會看不到舊資料
+- 若有先前匯出的 JSON，可用頁面右上角 `匯入備份` 還原
 
 ## 常用指令
 

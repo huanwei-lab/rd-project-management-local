@@ -6,7 +6,7 @@ async function loginAs(baseUrl, email) {
   const login = await fetch(`${baseUrl}/api/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email })
+    body: JSON.stringify({ email, password: 'Admin@2026Secure' })
   });
   assert.equal(login.status, 200);
   const cookie = login.headers.get('set-cookie');
@@ -26,13 +26,19 @@ test('local deployment server exposes session and state endpoints', async () => 
 
     const session = await fetch(`${baseUrl}/api/session`);
     assert.equal(session.status, 401);
+    const anonymousWrite = await fetch(`${baseUrl}/api/state`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projects: [{ id: 'unauthorized', name: 'Unauthorized', members: {}, tasks: [] }] })
+    });
+    assert.equal(anonymousWrite.status, 401);
     const users = await fetch(`${baseUrl}/api/login/options`);
     assert.equal(users.status, 200);
     const usersData = await users.json();
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: usersData.users[0].email })
+      body: JSON.stringify({ email: usersData.users[0].email, password: 'Admin@2026Secure' })
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get('set-cookie');
@@ -96,7 +102,7 @@ test('local deployment server includes CORS headers on validation errors', async
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: usersData.users[0].email })
+      body: JSON.stringify({ email: usersData.users[0].email, password: 'Admin@2026Secure' })
     });
     const cookie = login.headers.get('set-cookie');
 
@@ -131,7 +137,7 @@ test('local deployment server supports logout and blocks state access after logo
     const login = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: usersData.users[0].email })
+      body: JSON.stringify({ email: usersData.users[0].email, password: 'Admin@2026Secure' })
     });
     const cookie = login.headers.get('set-cookie');
 
@@ -213,6 +219,80 @@ test('local deployment server supports admin user CRUD and audit logs', async ()
   }
 });
 
+test('a multi-role admin can open account management APIs', async () => {
+  const { server, close } = await createServer({ host: '127.0.0.1', port: 0, dbPath: ':memory:' });
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const adminCookie = await loginAs(baseUrl, 'local-admin@localhost');
+    const createUser = await fetch(`${baseUrl}/api/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: adminCookie },
+      body: JSON.stringify({
+        email: 'eric.wang@kuentong.com',
+        displayName: 'Eric',
+        accessRole: 'admin,pm',
+        password: 'Welcome2026'
+      })
+    });
+    assert.equal(createUser.status, 201);
+
+    const ericLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'eric.wang@kuentong.com', password: 'Welcome2026' })
+    });
+    assert.equal(ericLogin.status, 200);
+    const users = await fetch(`${baseUrl}/api/users`, { headers: { cookie: ericLogin.headers.get('set-cookie') } });
+    assert.equal(users.status, 200);
+
+    const roleMembers = await fetch(`${baseUrl}/api/role-members`, { headers: { cookie: ericLogin.headers.get('set-cookie') } });
+    assert.equal(roleMembers.status, 200);
+    const roleMembersData = await roleMembers.json();
+    assert.deepEqual(roleMembersData.users, [{ displayName: 'Eric', accessRole: 'admin,pm' }, { displayName: 'Local Admin', accessRole: 'admin' }]);
+  } finally {
+    await close();
+  }
+});
+
+test('admin backup restore replaces shared state and snapshots the prior state', async () => {
+  const { server, close } = await createServer({ host: '127.0.0.1', port: 0, dbPath: ':memory:' });
+  const project = (id, name) => ({
+    id,
+    name,
+    description: '',
+    members: { PM: 'Local Admin' },
+    tasks: []
+  });
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const cookie = await loginAs(baseUrl, 'local-admin@localhost');
+    const initialState = { projects: [project('before', 'Before restore')] };
+    const seed = await fetch(`${baseUrl}/api/state`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify(initialState)
+    });
+    assert.equal(seed.status, 200);
+
+    const restoredState = { projects: [project('after', 'Restored project')] };
+    const restore = await fetch(`${baseUrl}/api/state/restore`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ state: restoredState })
+    });
+    assert.equal(restore.status, 200);
+    const restoreData = await restore.json();
+    assert.equal(typeof restoreData.backupId, 'number');
+
+    const current = await fetch(`${baseUrl}/api/state`, { headers: { cookie } });
+    assert.deepEqual((await current.json()).state, restoredState);
+  } finally {
+    await close();
+  }
+});
+
 test('local deployment server enforces server-side write authorization', async () => {
   const { server, close } = await createServer({
     host: '127.0.0.1',
@@ -236,7 +316,8 @@ test('local deployment server enforces server-side write authorization', async (
       body: JSON.stringify({
         email: 'viewer@localhost',
         displayName: 'Viewer User',
-        accessRole: 'viewer'
+        accessRole: 'viewer',
+        password: 'SharedPass2026'
       })
     });
     assert.equal(createUser.status, 201);
@@ -273,7 +354,13 @@ test('local deployment server enforces server-side write authorization', async (
     });
     assert.equal(seed.status, 200);
 
-    const viewerCookie = await loginAs(baseUrl, 'viewer@localhost');
+    const viewerLogin = await fetch(`${baseUrl}/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'viewer@localhost', password: 'SharedPass2026' })
+    });
+    assert.equal(viewerLogin.status, 200);
+    const viewerCookie = viewerLogin.headers.get('set-cookie');
     const illegalChange = JSON.parse(JSON.stringify(seedState));
     illegalChange.projects[0].name = 'Hacked Name';
 

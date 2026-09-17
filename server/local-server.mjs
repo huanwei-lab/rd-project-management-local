@@ -64,16 +64,13 @@ const ADVANCED_COMPLIANCE = {
   }
 };
 
-// ISO 27001 compliant password policy
+// Organization password policy: 10+ characters with letters and numbers
 function validatePassword(password, email) {
   if (!password) return { valid: false, error: '密碼不能為空' };
-  if (password.length < 12) return { valid: false, error: '密碼至少需要 12 個字符（ISO 27001 規範）' };
-  if (!/[A-Z]/.test(password)) return { valid: false, error: '密碼必須包含至少一個大寫字母' };
-  if (!/[a-z]/.test(password)) return { valid: false, error: '密碼必須包含至少一個小寫字母' };
-  if (!/\d/.test(password)) return { valid: false, error: '密碼必須包含至少一個數字' };
-  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>?]/.test(password)) {
-    return { valid: false, error: '密碼必須包含至少一個特殊字符（!@#$%^&*等）' };
-  }
+  if (password.length < 10) return { valid: false, error: '密碼至少需要 10 個字符' };
+  // Must contain letters (any case) and numbers
+  if (!/[A-Za-z]/.test(password)) return { valid: false, error: '密碼必須包含字母' };
+  if (!/\d/.test(password)) return { valid: false, error: '密碼必須包含數字' };
   // Prevent using email/username in password
   if (email && password.toLowerCase().includes(email.split('@')[0].toLowerCase())) {
     return { valid: false, error: '密碼不能包含帳號名稱' };
@@ -116,16 +113,14 @@ function hashPasswordSync(password) {
 }
 
 function generateSecurePassword() {
-  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const lower = 'abcdefghijklmnopqrstuvwxyz';
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
   const digits = '0123456789';
-  const special = '!@#$%^&*_+-=';
-  const all = upper + lower + digits + special;
+  const all = letters + digits;
   let pwd = '';
-  pwd += upper[Math.floor(Math.random() * upper.length)];
-  pwd += lower[Math.floor(Math.random() * lower.length)];
+  // Ensure at least one letter and one digit
+  pwd += letters[Math.floor(Math.random() * letters.length)];
   pwd += digits[Math.floor(Math.random() * digits.length)];
-  pwd += special[Math.floor(Math.random() * special.length)];
+  // Generate remaining 8 characters
   for (let i = 0; i < 8; i++) {
     pwd += all[Math.floor(Math.random() * all.length)];
   }
@@ -152,6 +147,14 @@ function initializeDatabase(db) {
       json TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       updated_by TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS rd_app_state_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      json TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      created_by TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS rd_app_users (
@@ -401,7 +404,7 @@ function safeParseInt(value, fallback) {
 function validateUserPayload(payload, { partial = false } = {}) {
   const email = payload?.email?.trim()?.toLowerCase();
   const displayName = payload?.displayName?.trim();
-  const accessRole = payload?.accessRole?.trim()?.toLowerCase();
+  const accessRole = normalizeRoles(payload?.accessRole);
 
   if (!partial || payload?.email !== undefined) {
     if (!email || !email.includes('@')) {
@@ -416,7 +419,7 @@ function validateUserPayload(payload, { partial = false } = {}) {
   }
 
   if (!partial || payload?.accessRole !== undefined) {
-    if (!accessRole || !allowedRoles.has(accessRole)) {
+    if (!accessRole) {
       return { error: '角色無效' };
     }
   }
@@ -424,12 +427,23 @@ function validateUserPayload(payload, { partial = false } = {}) {
   return { email, displayName, accessRole };
 }
 
+function normalizeRoles(value) {
+  if (typeof value !== 'string') return '';
+  const roles = [...new Set(value.split(',').map((role) => role.trim().toLowerCase()).filter(Boolean))];
+  return roles.length && roles.every((role) => allowedRoles.has(role)) ? roles.join(',') : '';
+}
+
+// Checks a comma-separated role list, e.g. "admin,pm,pe".
+function userHasRole(user, requiredRole) {
+  return normalizeRoles(user?.accessRole).split(',').includes(requiredRole);
+}
+
 function canManageProject(project, userDisplayName) {
   return project?.members?.PM === userDisplayName || project?.members?.PE === userDisplayName;
 }
 
 function canWriteState(user, currentState, nextState) {
-  if (user?.accessRole === 'admin') {
+  if (userHasRole(user, 'admin')) {
     return true;
   }
 
@@ -540,8 +554,30 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         return;
       }
 
+      if (url.pathname === '/api/role-members' && request.method === 'GET') {
+        if (!user) {
+          response.writeHead(401, addCorsHeaders({ 'content-type': 'application/json; charset=utf-8' }));
+          response.end(JSON.stringify({ error: '請先登入' }));
+          return;
+        }
+
+        const users = db.prepare(`
+          SELECT u.display_name AS displayName, u.access_role AS accessRole
+          FROM rd_app_users u
+          LEFT JOIN rd_app_user_security sec ON u.email = sec.email
+          WHERE COALESCE(sec.enabled, 1) = 1
+          ORDER BY u.display_name COLLATE NOCASE ASC, u.email ASC
+        `).all();
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify({ users }));
+        return;
+      }
+
       if (url.pathname === '/api/users' && request.method === 'GET') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -565,7 +601,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/users' && request.method === 'POST') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -630,7 +666,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname.startsWith('/api/users/') && request.method === 'PATCH') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -671,8 +707,11 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
 
         const now = new Date().toISOString();
         const nextRole = validated.accessRole || existing.accessRole;
-        if (existing.accessRole === 'admin' && nextRole !== 'admin') {
-          const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users WHERE access_role='admin'").get().n;
+        // 檢查是否在移除最後一個 admin
+        const hadAdminRole = userHasRole(existing, 'admin');
+        const willHaveAdminRole = userHasRole({ accessRole: nextRole }, 'admin');
+        if (hadAdminRole && !willHaveAdminRole) {
+          const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users u WHERE u.access_role LIKE '%admin%'").get().n;
           if (adminCount <= 1) {
             response.writeHead(400, addCorsHeaders({
               'content-type': 'application/json; charset=utf-8'
@@ -712,7 +751,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname.startsWith('/api/users/') && request.method === 'DELETE') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -730,8 +769,8 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
           return;
         }
 
-        if (existing.accessRole === 'admin') {
-          const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users WHERE access_role='admin'").get().n;
+        if (userHasRole(existing, 'admin')) {
+          const adminCount = db.prepare("SELECT COUNT(*) AS n FROM rd_app_users u WHERE u.access_role LIKE '%admin%'").get().n;
           if (adminCount <= 1) {
             response.writeHead(400, addCorsHeaders({
               'content-type': 'application/json; charset=utf-8'
@@ -754,7 +793,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname.startsWith('/api/users/') && url.pathname.endsWith('/force-logout') && request.method === 'POST') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -773,7 +812,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname.startsWith('/api/users/') && url.pathname.endsWith('/toggle-enable') && request.method === 'POST') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -812,7 +851,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/audit' && request.method === 'GET') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -975,6 +1014,60 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
         return;
       }
 
+      if (url.pathname === '/api/state/restore' && request.method === 'POST') {
+        if (!user || !userHasRole(user, 'admin')) {
+          response.writeHead(403, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '需要管理者權限' }));
+          return;
+        }
+
+        const payload = await parseJsonBody(request);
+        const next = payload?.state;
+        if (!validState(next)) {
+          response.writeHead(400, addCorsHeaders({
+            'content-type': 'application/json; charset=utf-8'
+          }));
+          response.end(JSON.stringify({ error: '備份檔中的專案資料格式錯誤' }));
+          return;
+        }
+
+        const currentRow = db.prepare("SELECT json FROM rd_app_state WHERE key='main'").get();
+        const now = new Date().toISOString();
+        const body = JSON.stringify(next);
+        let backupId = null;
+        try {
+          db.exec('BEGIN IMMEDIATE;');
+          if (currentRow) {
+            const backup = db.prepare('INSERT INTO rd_app_state_backups (json, source, created_at, created_by) VALUES (?, ?, ?, ?)').run(
+              currentRow.json,
+              'json_import',
+              now,
+              user.email
+            );
+            backupId = Number(backup.lastInsertRowid);
+          }
+          db.prepare("INSERT INTO rd_app_state (key, json, updated_at, updated_by) VALUES ('main', ?, ?, ?) ON CONFLICT(key) DO UPDATE SET json=excluded.json, updated_at=excluded.updated_at, updated_by=excluded.updated_by").run(body, now, user.email);
+          appendAudit(db, user.email, 'restore_state_backup', 'warning', {
+            backupId,
+            restoredProjects: next.projects.length
+          });
+          recordSecurityEvent(db, user.email, 'state_restored', 'warning', `Restored ${next.projects.length} projects from JSON backup`, null, null);
+          db.exec('COMMIT;');
+        } catch (error) {
+          try { db.exec('ROLLBACK;'); } catch {}
+          throw error;
+        }
+
+        response.writeHead(200, addCorsHeaders({
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store'
+        }));
+        response.end(JSON.stringify({ ok: true, backupId, updatedAt: now, updatedBy: user.email }));
+        return;
+      }
+
       if (url.pathname === '/api/state') {
         if (!user) {
           response.writeHead(401, addCorsHeaders({
@@ -1039,7 +1132,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       // ===== Advanced Compliance APIs (ISO 27001 A.9.2, A.9.4, A.12.4) =====
 
       if (url.pathname === '/api/compliance/permission-review' && request.method === 'GET') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -1119,7 +1212,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/compliance/security-events' && request.method === 'GET') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -1157,7 +1250,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/compliance/password-expiration' && request.method === 'GET') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
@@ -1215,7 +1308,7 @@ export async function createServer({ host = '0.0.0.0', port = 3000, dbPath = def
       }
 
       if (url.pathname === '/api/compliance/session-monitoring' && request.method === 'GET') {
-        if (!user || user.accessRole !== 'admin') {
+        if (!user || !userHasRole(user, 'admin')) {
           response.writeHead(403, addCorsHeaders({
             'content-type': 'application/json; charset=utf-8'
           }));
